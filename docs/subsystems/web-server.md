@@ -85,6 +85,8 @@ No composition can bind every interface at once: the unspecified address is reje
 
 A request whose handling throws (a malformed %-escape hitting `decodeURIComponent`, a client dropping mid-body) is logged as a warning and answered 400 — or the socket destroyed when headers are already out — never a process exit. Disposal pairs `close()` with `closeAllConnections()` because a handler may hold its response open (SSE) and such connections never end on their own; without the force-close, teardown would hang. A TLS socket counts as a connection only after its handshake, so the server tracks raw TLS sockets beside upgraded ones and destroys both at disposal. The package never prints: the URL line belongs to the shell. Per-package operational detail, including the dev-mode bundle watch pipeline, stays in the [README](../../packages/host/webserver/README.md).
 
+Application-managed authentication and Peer revocation use the [Connection policy](../../packages/client/connection/README.md#browser-authentication-and-request-trust); the carrier only applies its admission result.
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>
@@ -108,7 +110,7 @@ Host `ctx.connection` members consumed by transport-independent adapters.
 createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 
 /**
- * Apply Connection's Host/Origin checks and browser authentication to
+ * Apply Connection's Host/Origin checks and configured authentication to
  * another Web route.
  * @param request - request headers from the HTTP or upgrade request.
  * @returns rejection status, or undefined when the route may accept the request.
@@ -116,15 +118,15 @@ createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
 
 /**
- * Admit one request, resolving its optional identity after transport checks.
+ * Admit one request using the configured policy after the Host/Origin checks.
  * @param request - request headers from the HTTP or upgrade request.
- * @returns the operator Peer and optional verified principal, or the rejection status.
+ * @returns the policy-owned Peer and identity, or a rejection (including unavailable authentication).
  */
 admit(request: ConnectionTrustRequest): PeerAdmission
 
 /**
- * Authenticate one frontend index request, owning a token redirect or 401.
- * The cookie this mints is `Secure` when the mounted Web carrier serves TLS,
+ * Authenticate one frontend index request, owning its redirect or refusal.
+ * Operator cookies are `Secure` when the mounted Web carrier serves TLS,
  * which only that listener's protocol decides.
  * @param request - root or configured-index HTTP request.
  * @param response - response owned when the result is false.
@@ -133,9 +135,9 @@ admit(request: ConnectionTrustRequest): PeerAdmission
 authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean
 
 /**
- * Add the fresh process token to an ordinary Web application URL.
+ * Return an application URL; only operator mode adds its process token.
  * @param baseUrl - clean application URL whose authority and mount are preserved.
- * @returns tokenized URL for initial login; a mount proxy strips its prefix before {@link authorizeIndex}.
+ * @returns a tokenized operator URL or the unchanged application URL.
  */
 authenticatedUrl(baseUrl: string): string
 ```

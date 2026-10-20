@@ -15,6 +15,11 @@ import { ConnectionRecoveryConfigSchema, resolveConnectionConfig, type Connectio
 
 export type {
   PeerAdmission,
+  ApplicationPeerAdmission,
+  ApplicationIndexAdmission,
+  ApplicationAuthenticationProvider,
+  HostConnectionAuthentication,
+  ConnectionAuthenticationMode,
   ConnectionFetchMethod,
   ConnectionFetchHandler,
   ConnectionFetchRoute,
@@ -94,6 +99,8 @@ export const inject = ['credentials']
 export interface ConnectionConfig {
   /** Browser recovery timing, injected into each served page. */
   recovery?: ConnectionRecoveryConfig
+  /** Authentication policy. Application mode requires a registered provider and denies when absent. */
+  authenticationMode?: 'operator' | 'application'
   /**
    * Authorities this deployment serves beyond loopback: exact `host:port`, or
    * port-less `host` matching any port. The fence accepts loopback and the
@@ -109,6 +116,7 @@ export interface ConnectionConfig {
 
 export const Config: z<ConnectionConfig> = z.object({
   recovery: ConnectionRecoveryConfigSchema.default({}),
+  authenticationMode: z.union(['operator', 'application']).default('operator'),
   trustedHosts: z.array(String).default([]),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
@@ -135,6 +143,7 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
     ctx,
     trustedHosts,
     await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
+    config?.authenticationMode ?? 'operator',
   )
   ctx.inject(['webServer'], (webCtx) => {
     assertImageBodyCapacity(webCtx, maxRequestBodyBytes)
@@ -148,8 +157,8 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
       handler: async (req, res) => {
         const admission = connection.admit(req)
         if ('rejection' in admission) {
-          res.writeHead(admission.rejection)
-          res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden')
+          res.writeHead(admission.rejection, { 'Cache-Control': 'private, no-store' })
+          res.end(admission.rejection === 503 ? 'authentication unavailable' : admission.rejection === 401 ? 'unauthorized' : 'forbidden')
           return
         }
         await webCtx.waterfall('connection/request', req, res, () => bridge(req, res, {

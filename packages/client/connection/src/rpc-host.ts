@@ -16,6 +16,10 @@ import type { BrowserAuth } from './browser-auth.ts'
 import { OperatorPeer } from './operator-peer.ts'
 import type {
   PeerAdmission,
+  ApplicationAuthenticationProvider,
+  ApplicationPeerAdmission,
+  ConnectionAuthenticationMode,
+  HostConnectionAuthentication,
   ConnectionIndexRequest,
   ConnectionIndexResponse,
   ConnectionFetchRoute,
@@ -67,6 +71,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
   private readonly interceptors = new Map<string, ConnectionRpcInterceptor>()
   private readonly fetchRoutes = new Map<string, RegisteredFetchRoute>()
   private principalResolver: RequestPrincipalResolver | undefined
+  private authenticationProvider: ApplicationAuthenticationProvider | undefined
 
   readonly allowsRemoteAuthorities: boolean
 
@@ -75,11 +80,13 @@ export class HostConnectionService extends Service implements HostConnectionHand
    * @param ctx - owning Connection plugin context.
    * @param trustedHosts - deployment authorities accepted by the Host/Origin fence.
    * @param browserAuth - process token and persistent browser-session owner.
+   * @param authenticationMode - explicit policy; application mode has no operator fallback.
    */
   constructor(
     ctx: Context,
     private readonly trustedHosts: readonly string[],
     private readonly browserAuth: BrowserAuth,
+    readonly authenticationMode: ConnectionAuthenticationMode = 'operator',
   ) {
     super(ctx, 'connection')
     this.operator = new OperatorPeer(ctx)
@@ -109,6 +116,34 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
   }
 
+  /** Application authentication registration scoped to the contributing plugin. */
+  get authentication(): HostConnectionAuthentication {
+    const owner = this.ctx
+    return {
+      register: provider => owner.effect(() => {
+        if (this.authenticationProvider !== undefined) throw new Error('connection: application authentication is already registered')
+        this.authenticationProvider = provider
+        return () => { this.authenticationProvider = undefined }
+      }, 'client-connection: application authentication'),
+    }
+  }
+
+  private trusted(request: ConnectionTrustRequest): boolean {
+    const carrier = this.ctx.get('webServer')
+    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')
+  }
+
+  private applicationAdmission(request: ConnectionTrustRequest): ApplicationPeerAdmission {
+    if (this.authenticationProvider === undefined) return { rejection: 503 }
+    try {
+      return this.authenticationProvider.admit(request)
+    } catch (_error) {
+      // Provider errors may contain credentials; only the disposition is logged.
+      this.ctx.logger.warn('Application authentication failed; request refused. Restore the authentication provider before retrying.')
+      return { rejection: 503 }
+    }
+  }
+
   /** Exact Fetch-route registry scoped to the Context reading this service. */
   get fetch(): HostConnectionFetch {
     const owner = this.ctx
@@ -117,15 +152,21 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
   }
 
-  /** Apply the Host/Origin fence, then browser authentication. */
+  /** Apply the Host/Origin fence and the selected authentication policy. */
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
-    const carrier = this.ctx.get('webServer')
-    if (!isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')) return 403
-    return this.browserAuth.isAuthenticated(request, carrier?.protocol === 'https:') ? undefined : 401
+    if (!this.trusted(request)) return 403
+    if (this.authenticationMode === 'application') {
+      const admission = this.applicationAdmission(request)
+      return 'rejection' in admission ? admission.rejection : undefined
+    }
+    return this.browserAuth.isAuthenticated(request, this.ctx.get('webServer')?.protocol === 'https:') ? undefined : 401
   }
 
-  /** A request that passes the fence and authentication speaks for the operator. */
+  /** Admit through the selected policy; application mode never enriches an operator fallback. */
   admit(request: ConnectionTrustRequest): PeerAdmission {
+    if (this.authenticationMode === 'application') {
+      return this.trusted(request) ? this.applicationAdmission(request) : { rejection: 403 }
+    }
     const rejection = this.requestRejection(request)
     if (rejection !== undefined) return { rejection }
     const principal = this.principalResolver?.(request)
@@ -133,15 +174,40 @@ export class HostConnectionService extends Service implements HostConnectionHand
   }
 
   /**
-   * Authenticate an index request; native TLS listeners mint Secure cookies.
+   * Authenticate an index request. Operator mode delegates its token exchange;
+   * application mode obtains a decision before Connection writes any response.
    */
   authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean {
-    return this.browserAuth.authorizeIndex(request, response, this.ctx.get('webServer')?.protocol === 'https:')
+    if (this.authenticationMode === 'operator') {
+      return this.browserAuth.authorizeIndex(request, response, this.ctx.get('webServer')?.protocol === 'https:')
+    }
+    if (!this.trusted(request)) {
+      response.writeHead(403, { 'Cache-Control': 'private, no-store' })
+      response.end('forbidden')
+      return false
+    }
+    let decision
+    try {
+      decision = this.authenticationProvider?.index(request) ?? { kind: 'reject' as const, status: 503 as const }
+    } catch (_error) {
+      // The provider has not written a response; Connection can safely refuse it.
+      this.ctx.logger.warn('Application authentication failed; frontend refused. Restore the authentication provider before retrying.')
+      decision = { kind: 'reject' as const, status: 503 as const }
+    }
+    if (decision.kind === 'allow') return true
+    if (decision.kind === 'redirect') {
+      response.writeHead(302, { Location: decision.location, 'Cache-Control': 'private, no-store' })
+      response.end()
+      return false
+    }
+    response.writeHead(decision.status, { 'Cache-Control': 'private, no-store' })
+    response.end(decision.status === 503 ? 'authentication unavailable' : decision.status === 401 ? 'unauthorized' : 'forbidden')
+    return false
   }
 
-  /** Add this process's launch token to the clean application URL. */
+  /** Return a clean application URL or the operator token exchange URL. */
   authenticatedUrl(baseUrl: string): string {
-    return this.browserAuth.authenticatedUrl(baseUrl)
+    return this.authenticationMode === 'application' ? baseUrl : this.browserAuth.authenticatedUrl(baseUrl)
   }
 
   /**
@@ -158,6 +224,12 @@ export class HostConnectionService extends Service implements HostConnectionHand
         return route?.methods.has(method) === true ? route.requestBody : 'buffered'
       },
       fetch: (request, admission) => {
+        if (this.authenticationMode === 'application' && (admission === undefined || !('principal' in admission) || admission.principal === undefined)) {
+          const status = admission !== undefined && 'rejection' in admission ? admission.rejection : 401
+          return Promise.resolve(new Response(status === 503 ? 'authentication unavailable' : 'unauthorized', {
+            status, headers: { 'Cache-Control': 'private, no-store' },
+          }))
+        }
         if (admission !== undefined && 'rejection' in admission) {
           return Promise.resolve(new Response('unauthorized', { status: admission.rejection }))
         }
@@ -206,8 +278,8 @@ export class HostConnectionService extends Service implements HostConnectionHand
       handler: async (req, res) => {
         const admission = this.admit(req)
         if ('rejection' in admission) {
-          res.writeHead(admission.rejection)
-          res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden')
+          res.writeHead(admission.rejection, { 'Cache-Control': 'private, no-store' })
+          res.end(admission.rejection === 503 ? 'authentication unavailable' : admission.rejection === 401 ? 'unauthorized' : 'forbidden')
           return
         }
         await bridge(req, res, {

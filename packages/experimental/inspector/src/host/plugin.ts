@@ -113,7 +113,7 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
         handler: (req, socket, head) => {
           const rejection = ctx.connection.requestRejection(req)
           if (rejection !== undefined) {
-            const reason = rejection === 401 ? 'Unauthorized' : 'Forbidden'
+            const reason = rejection === 503 ? 'Service Unavailable' : rejection === 401 ? 'Unauthorized' : 'Forbidden'
             socket.end(`HTTP/1.1 ${rejection} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
             return
           }

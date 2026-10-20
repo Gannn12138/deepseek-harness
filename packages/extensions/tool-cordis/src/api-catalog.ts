@@ -750,7 +750,17 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'readonly identity: HostConnectionIdentity',
-        description: 'Server-side request identity integration.',
+        description: 'Optional identity enrichment for operator-mode requests.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly authentication: HostConnectionAuthentication',
+        description: 'Application authentication provider registration.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly authenticationMode: ConnectionAuthenticationMode',
+        description: 'Deployment policy; application mode never falls back to operator authentication.',
         parameters: [],
       },
       {
@@ -776,27 +786,27 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection',
-        description: 'Apply Connection\'s Host/Origin checks and browser authentication to another Web route.',
+        description: 'Apply Connection\'s Host/Origin checks and configured authentication to another Web route.',
         parameters: [{ name: 'request', description: 'request headers from the HTTP or upgrade request.' }],
         returns: 'rejection status, or undefined when the route may accept the request.',
       },
       {
         signature: 'admit(request: ConnectionTrustRequest): PeerAdmission',
-        description: 'Admit one request, resolving its optional identity after transport checks.',
+        description: 'Admit one request using the configured policy after the Host/Origin checks.',
         parameters: [{ name: 'request', description: 'request headers from the HTTP or upgrade request.' }],
-        returns: 'the operator Peer and optional verified principal, or the rejection status.',
+        returns: 'the policy-owned Peer and identity, or a rejection (including unavailable authentication).',
       },
       {
         signature: 'authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean',
-        description: 'Authenticate one frontend index request, owning a token redirect or 401. The cookie this mints is `Secure` when the mounted Web carrier serves TLS, which only that listener\'s protocol decides.',
+        description: 'Authenticate one frontend index request, owning its redirect or refusal. Operator cookies are `Secure` when the mounted Web carrier serves TLS, which only that listener\'s protocol decides.',
         parameters: [{ name: 'request', description: 'root or configured-index HTTP request.' }, { name: 'response', description: 'response owned when the result is false.' }],
         returns: 'true only when the frontend may serve index.html.',
       },
       {
         signature: 'authenticatedUrl(baseUrl: string): string',
-        description: 'Add the fresh process token to an ordinary Web application URL.',
+        description: 'Return an application URL; only operator mode adds its process token.',
         parameters: [{ name: 'baseUrl', description: 'clean application URL whose authority and mount are preserved.' }],
-        returns: 'tokenized URL for initial login; a mount proxy strips its prefix before {@link authorizeIndex}.',
+        returns: 'a tokenized operator URL or the unchanged application URL.',
       },
     ],
   },
@@ -4675,6 +4685,18 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type ApiSessionAgentResult = {\n    readonly agent: Agent;\n} | {\n    readonly error: ApiSessionAgentError;\n};',
   },
   {
+    name: 'ApplicationAuthenticationProvider',
+    declaration: 'export interface ApplicationAuthenticationProvider {\n    admit(request: ConnectionTrustRequest): ApplicationPeerAdmission;\n    index(request: ConnectionIndexRequest): ApplicationIndexAdmission;\n}',
+  },
+  {
+    name: 'ApplicationIndexAdmission',
+    declaration: 'export type ApplicationIndexAdmission = {\n    readonly kind: \'allow\';\n} | {\n    readonly kind: \'redirect\';\n    readonly location: string;\n} | {\n    readonly kind: \'reject\';\n    readonly status: 401 | 403 | 503;\n};',
+  },
+  {
+    name: 'ApplicationPeerAdmission',
+    declaration: 'export type ApplicationPeerAdmission = {\n    readonly peer: PeerScope;\n    readonly principal: RequestPrincipal;\n} | {\n    readonly rejection: 401 | 403 | 503;\n};',
+  },
+  {
     name: 'ApprovalOutcome',
     declaration: 'export type ApprovalOutcome = \'allowed-once\' | \'rejected\' | \'cancelled\' | \'unavailable\';',
   },
@@ -4975,6 +4997,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type ConfinedSandboxMode = Exclude<SandboxMode, \'danger-full-access\'>;',
   },
   {
+    name: 'ConnectionAuthenticationMode',
+    declaration: 'export type ConnectionAuthenticationMode = \'operator\' | \'application\';',
+  },
+  {
     name: 'ConnectionFetchHandler',
     declaration: 'export interface ConnectionFetchHandler {\n    requestBodyMode(request: {\n        readonly method: string;\n        readonly url: URL;\n    }): ConnectionRequestBodyMode;\n    fetch(request: Request, admission?: PeerAdmission): Promise<Response>;\n}',
   },
@@ -5000,7 +5026,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ConnectionRequestRejection',
-    declaration: 'export type ConnectionRequestRejection = 401 | 403 | undefined;',
+    declaration: 'export type ConnectionRequestRejection = 401 | 403 | 503 | undefined;',
   },
   {
     name: 'ConnectionRpcAttachment',
@@ -5521,6 +5547,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'HookRegistration',
     declaration: 'export interface HookRegistration {\n    catch(handler: AnyHook): void;\n}',
+  },
+  {
+    name: 'HostConnectionAuthentication',
+    declaration: 'export interface HostConnectionAuthentication {\n    register(provider: ApplicationAuthenticationProvider): () => Promise<void>;\n}',
   },
   {
     name: 'HostConnectionFetch',
@@ -6156,7 +6186,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'PeerAdmission',
-    declaration: 'export type PeerAdmission = {\n    readonly peer: PeerScope;\n    readonly principal?: RequestPrincipal;\n} | {\n    readonly rejection: 401 | 403;\n};',
+    declaration: 'export type PeerAdmission = {\n    readonly peer: PeerScope;\n    readonly principal?: RequestPrincipal;\n} | {\n    readonly rejection: 401 | 403 | 503;\n};',
   },
   {
     name: 'PeerId',

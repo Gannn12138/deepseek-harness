@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
+import { get as httpGet } from 'node:http'
 import { queryObjects } from 'node:v8'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket, { type RawData } from 'ws'
 import { Context, symbols } from '@deepseek-ai/cordis'
-import { apply as applyConnection, inject as connectionInject } from '@deepseek-ai/dsh-client-connection'
+import { apply as applyConnection, inject as connectionInject, type ConnectionAuthenticationMode } from '@deepseek-ai/dsh-client-connection'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type { AppReady } from '@deepseek-ai/dsh-cmdline'
@@ -1533,6 +1534,24 @@ describe('Typert Remote streams', () => {
     ;(request as { abort(): void }).abort()
   })
 
+  it('answers with 503 before upgrading when application authentication is unavailable', async () => {
+    const { ctx } = await setup(true, {}, undefined, 'application')
+    const status = await new Promise<number>((resolve, reject) => {
+      const request = httpGet(`http://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`, {
+        headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' },
+      }, (response) => {
+        response.resume()
+        response.once('end', () => { resolve(response.statusCode ?? 0); request.destroy() })
+      })
+      request.once('upgrade', (_response, socket) => {
+        socket.destroy()
+        reject(new Error('application request upgraded without an authentication provider'))
+      })
+      request.once('error', reject)
+    })
+    expect(status).toBe(503)
+  })
+
   it('answers an unauthenticated trusted Host with 401 before opening a stream', async () => {
     const { ctx } = await setup(true)
     const socket = new WebSocket(`ws://127.0.0.1:${String(ctx.webServer.port)}/api/remote.mux`)
@@ -1551,6 +1570,7 @@ async function setup(
   transport: boolean,
   gatewayConfig: GatewayConfig = {},
   ready?: AppReady,
+  authenticationMode: ConnectionAuthenticationMode = 'operator',
 ): Promise<{ readonly ctx: Context; readonly service: FeedService }> {
   const ctx = new Context()
   roots.push(ctx)
@@ -1562,7 +1582,7 @@ async function setup(
   await ctx.plugin(TypertRegistry)
   await ctx.plugin(TypertGatewayService, gatewayConfig)
   if (transport) {
-    await ctx.plugin({ inject: [...connectionInject], apply: applyConnection })
+    await ctx.plugin({ inject: [...connectionInject], apply: applyConnection }, { authenticationMode })
   }
   await ctx.plugin(FeedService)
   ctx.typert.register({

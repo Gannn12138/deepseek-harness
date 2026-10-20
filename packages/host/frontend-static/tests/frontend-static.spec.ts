@@ -217,3 +217,78 @@ describe('real Loader composition', () => {
     expect(() => server.registerFallback(() => {})).not.toThrow()
   })
 })
+
+it('boots application policy through real Loader rows and exercises HTTP index, Fetch and RPC', async () => {
+  root = await mkdtemp(join(tmpdir(), 'dsh-application-auth-'))
+  const ctx = context = new Context()
+  ctx.baseUrl = pathToFileURL(root).href + '/'
+  await mkdir(join(root, 'dist'))
+  await writeFile(join(root, 'dist/index.html'), '<head></head><body>protected application</body>')
+  let withdraw: (() => Promise<void>) | undefined
+  let fail = false
+  const fixture = {
+    name: 'application-auth-fixture', inject: ['connection'],
+    apply(owner: Context) {
+      const peers = new Map(['alice', 'bob'].map(id => [id, new Connection.OperatorPeer(owner)]))
+      for (const peer of peers.values()) owner.effect(() => () => peer.dispose())
+      const identity: Connection.ApplicationAuthenticationProvider = {
+        admit(request) {
+          if (fail) throw new Error('private-provider-failure')
+          const raw = request.headers instanceof Headers ? request.headers.get('cookie') : request.headers.cookie
+          const id = raw === 'probe=alice' ? 'alice' : raw === 'probe=bob' ? 'bob' : undefined
+          const peer = id === undefined ? undefined : peers.get(id)
+          return peer && id ? { peer, principal: { issuer: 'https://idp.test.invalid', id } } : { rejection: 401 }
+        },
+        index(request) { return 'rejection' in this.admit(request) ? { kind: 'redirect', location: '/login' } : { kind: 'allow' } },
+      }
+      withdraw = owner.connection.authentication.register(identity)
+      owner.connection.fetch.register({
+        path: '/api/auth-probe', methods: ['GET'], requestBody: 'buffered',
+        fetch: async (_request, admission) => Response.json(admission && 'peer' in admission
+          ? { id: admission.principal?.id, peer: admission.peer.id } : null),
+      })
+      owner.connection.rpc.intercept('/api', endpoint => endpoint === 'probe.identity',
+        async (_endpoint, _payload, _signal, peer, principal) => ({
+          ok: true, value: { id: principal?.id, peer: peer.id },
+        }))
+    },
+  }
+  await ctx.plugin(Loader)
+  Object.assign(ctx.loader.builtins, {
+    include: Include, credentials: LocalCredentials, http: HttpServer,
+    connection: Connection, frontend: FrontendStatic, fixture,
+  })
+  const configPath = join(root, 'cordis.yml')
+  await writeFile(configPath, [
+    '- name: cordis:credentials', '  config:', `    path: '${join(root, 'credentials.yaml')}'`, '    watch: false',
+    '- name: cordis:http', '  config:', '    host: 127.0.0.1', '    port: 0',
+    '- name: cordis:connection', '  config:', '    authenticationMode: application',
+    '- name: cordis:fixture',
+    '- name: cordis:frontend', '  config:', `    distIndex: '${join(root, 'dist/index.html')}'`, '',
+  ].join('\n'))
+  await ctx.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href } })
+  await ctx.loader.await()
+  await Promise.all([...ctx.loader.entries()].map(entry => entry.fiber?.await()))
+  const base = `http://127.0.0.1:${String(ctx.webServer.port)}`
+  expect(ctx.connection.authenticationMode).toBe('application')
+  expect(ctx.connection.authenticatedUrl(base)).toBe(base)
+  expect((await fetch(base + '/api/auth-probe')).status).toBe(401)
+  const login = await fetch(base + '/', { redirect: 'manual' })
+  expect(login.status).toBe(302)
+  expect(login.headers.get('location')).toBe('/login')
+  const alice = await fetch(base + '/api/auth-probe', { headers: { cookie: 'probe=alice', 'x-user-id': 'bob' } }).then(r => r.json())
+  const bob = await fetch(base + '/api/auth-probe', { headers: { cookie: 'probe=bob' } }).then(r => r.json())
+  expect(alice.id).toBe('alice'); expect(bob.id).toBe('bob'); expect(alice.peer).not.toBe(bob.peer)
+  expect((await fetch(base + '/', { headers: { cookie: 'probe=alice' } })).status).toBe(200)
+  const rpc = await fetch(base + '/api/probe.identity', {
+    method: 'POST', headers: { cookie: 'probe=alice', 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId: 'a', method: 'probe.identity', payload: { principal: { id: 'bob' } } }),
+  }).then(r => r.json())
+  expect(rpc.result.ok).toBe(true); expect(rpc.result.value.id).toBe('alice')
+  fail = true
+  const failed = await fetch(base + '/api/auth-probe', { headers: { cookie: 'probe=alice' } })
+  expect(failed.status).toBe(503); expect(await failed.text()).not.toContain('private-provider-failure')
+  await withdraw?.()
+  expect((await fetch(base + '/api/auth-probe', { headers: { cookie: 'probe=alice' } })).status).toBe(503)
+  expect((await fetch(base + '/', { redirect: 'manual', headers: { cookie: 'probe=alice' } })).status).toBe(503)
+}, 30_000)

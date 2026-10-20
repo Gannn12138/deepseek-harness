@@ -44,7 +44,9 @@ HTTPS cookie 名称与签名 audience 包含 `https:` scheme，因此即使 host
 
 认证之前，每个请求都经过 `src/api-request-trust.ts`。其 `Host` 必须是 loopback、等于监听器的绑定 IP 字面量（端口不限），或与 `trustedHosts` 条目匹配：带端口的 `host:port` 精确匹配，不带端口的条目匹配任意端口。Host 与配置条目按监听器的 scheme 做 WHATWG 默认端口归一化，不采信转发 header 或 `Origin`。附带的 HTTP(S) `Origin` 必须指向同一 authority；此时按 Origin 的 scheme 解析 Host，以支持 HTTPS 代理转发到 HTTP 上游；`sec-fetch-site: cross-site` 一律拒绝。畸形配置 authority 会让插件加载失败。`allowsRemoteAuthorities` 报告 `trustedHosts` 是否允许非 loopback authority；接受绑定 IP 不会改变该列表。这些检查防御 DNS rebinding 与跨站浏览器请求，绝不建立身份。Host/Origin 校验失败返回 403；Host 可信但未认证的请求返回 401。`dsh web --host 0.0.0.0` 不受支持。决策记录：[浏览器请求信任](../../../.agents/notes/implemented/architecture/2026-07-28-api-browser-trust-boundary.zh.md)与[浏览器令牌认证](../../../.agents/notes/implemented/architecture/2026-08-24-browser-token-authentication.zh.md)。
 
-每个被接纳的请求都代表同一个 Peer——操作者。`ctx.connection.operator` 就是这个 `PeerScope`：其 `ctx` 是拥有连接期注册的 Cordis scope，随 Connection 一起释放。`ctx.connection.admit(request)` 执行信任与浏览器会话检查，并调用服务端注册的 `ctx.connection.identity.register(resolver)` 解析可选的 `RequestPrincipal`。解析器只从服务端认证状态返回主体，不接受 RPC 参数中的用户标识；HTTP RPC 与 WebSocket 流都将本次准入的主体传给 Gateway。身份解析器可由所属插件释放。`OperatorPeer` 对外导出，供没有 Connection 的组合（例如 Gateway 的进程内载体）以同一约定拥有一个操作者 scope。
+`authenticationMode` 选择准入策略。默认的 `operator` 保留浏览器令牌交换和可选 `identity.register(resolver)` 主体补充；请求代表 `ctx.connection.operator`。需要应用身份的组合设置 `authenticationMode: application`，并向 `ctx.connection.authentication` 注册唯一的服务端认证提供方。提供方为每个请求和 WebSocket 升级返回必需的已验证主体及其拥有的 Peer；缺失、卸载或抛错返回 503，认证拒绝返回提供方的 401/403。Connection 始终先检查 Host/Origin；application 模式不接受 operator token，也不回退到可选主体解析器。application 模式下直接派发共享 Fetch 也必须带已准入主体。
+
+应用提供方还返回前端 allow/redirect/reject 决策；Connection 在取得决策后写响应，重定向与拒绝均为 private/no-store。应用启动 URL 不附带令牌。提供方负责服务端会话检查、安全登录跳转、Peer 生命周期、过期与撤销；释放 Peer 会关闭其绑定的 Gateway socket。Connection 只透传主体，不实现 OIDC、会话存储、资源授权或逐消息重新鉴权。`OperatorPeer` 仍供仅 operator 的载体使用。
 
 通过认证的共享 HTTP 请求在传输请求体之前经过 `connection/request` waterfall。监听器可以拒绝新请求，或等待 `next()` 直到响应完成；释放所属 fiber 会移除准入行为。Desktop 使用此扩展点，在已批准的安装期间锁住新的 API 工作，而不取消已接纳的工作。客户端断开会中止处理函数的信号；桥接器停止写入 socket，并排空剩余响应块。WebSocket 流仍由 API Gateway 负责。
 

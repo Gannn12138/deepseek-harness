@@ -101,7 +101,7 @@ export interface ConnectionTrustRequest {
 }
 
 /** HTTP status returned before dispatch, or undefined when the request may proceed. */
-export type ConnectionRequestRejection = 401 | 403 | undefined
+export type ConnectionRequestRejection = 401 | 403 | 503 | undefined
 
 /** Root/index request facts used by the browser-token exchange. */
 export interface ConnectionIndexRequest extends ConnectionTrustRequest {
@@ -118,7 +118,50 @@ export interface ConnectionIndexResponse {
 /** Outcome of admitting one request: the operator Peer and optional verified identity, or a refusal. */
 export type PeerAdmission =
   | { readonly peer: PeerScope; readonly principal?: RequestPrincipal }
-  | { readonly rejection: 401 | 403 }
+  | { readonly rejection: 401 | 403 | 503 }
+
+/** Authentication policy selected by the deployment composition. */
+export type ConnectionAuthenticationMode = 'operator' | 'application'
+
+/** An application admits a verified subject and its owned Peer, or refuses it. */
+export type ApplicationPeerAdmission =
+  | { readonly peer: PeerScope; readonly principal: RequestPrincipal }
+  | { readonly rejection: 401 | 403 | 503 }
+
+/** Frontend response decision; Connection owns writing the resulting response. */
+export type ApplicationIndexAdmission =
+  | { readonly kind: 'allow' }
+  | { readonly kind: 'redirect'; readonly location: string }
+  | { readonly kind: 'reject'; readonly status: 401 | 403 | 503 }
+
+/** Server-owned authentication used only by application-mode deployments. */
+export interface ApplicationAuthenticationProvider {
+  /**
+   * Check current authentication state before each request or upgrade.
+   * The provider owns Peer lifetime and must dispose affected Peers on revocation.
+   * @param request - carrier headers used for a server-side session lookup.
+   * @returns a verified principal and Peer, or a typed denial; thrown defects become 503.
+   */
+  admit(request: ConnectionTrustRequest): ApplicationPeerAdmission
+  /**
+   * Decide whether to serve the frontend or redirect to the configured login entry.
+   * Redirects must come from validated server configuration, never unchecked query values.
+   * @param request - trusted frontend request.
+   * @returns response decision; thrown defects become 503 before any response is written.
+   */
+  index(request: ConnectionIndexRequest): ApplicationIndexAdmission
+}
+
+/** Scoped registration of the sole application authentication provider. */
+export interface HostConnectionAuthentication {
+  /**
+   * Register authentication after its server-side state is ready.
+   * Removing the provider restores denial in application mode, never operator access.
+   * @param provider - server-owned admission and frontend authentication decisions.
+   * @returns scoped disposer removing this exact provider.
+   */
+  register(provider: ApplicationAuthenticationProvider): () => Promise<void>
+}
 
 /**
  * Resolve a verified identity from server-controlled authentication state.
@@ -127,7 +170,7 @@ export type PeerAdmission =
  */
 export type RequestPrincipalResolver = (request: ConnectionTrustRequest) => RequestPrincipal | undefined
 
-/** Registration point for an application authentication plugin. */
+/** Optional principal enrichment for the legacy operator authentication policy. */
 export interface HostConnectionIdentity {
   /**
    * Register the sole resolver used for admitted HTTP and upgrade requests.
@@ -211,8 +254,12 @@ export interface HostConnectionRpc {
 export interface HostConnectionHandle {
   /** Generic RPC channel registry. */
   readonly rpc: HostConnectionRpc
-  /** Server-side request identity integration. */
+  /** Optional identity enrichment for operator-mode requests. */
   readonly identity: HostConnectionIdentity
+  /** Application authentication provider registration. */
+  readonly authentication: HostConnectionAuthentication
+  /** Deployment policy; application mode never falls back to operator authentication. */
+  readonly authenticationMode: ConnectionAuthenticationMode
   /** Exact Fetch routes for streaming or browser-native responses. */
   readonly fetch: HostConnectionFetch
   /** The operator Peer every admitted request speaks for; its scope lives as long as Connection. */
@@ -232,7 +279,7 @@ export interface HostConnectionHandle {
   createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 
   /**
-   * Apply Connection's Host/Origin checks and browser authentication to
+   * Apply Connection's Host/Origin checks and configured authentication to
    * another Web route.
    * @param request - request headers from the HTTP or upgrade request.
    * @returns rejection status, or undefined when the route may accept the request.
@@ -240,15 +287,15 @@ export interface HostConnectionHandle {
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
 
   /**
-   * Admit one request, resolving its optional identity after transport checks.
+   * Admit one request using the configured policy after the Host/Origin checks.
    * @param request - request headers from the HTTP or upgrade request.
-   * @returns the operator Peer and optional verified principal, or the rejection status.
+   * @returns the policy-owned Peer and identity, or a rejection (including unavailable authentication).
    */
   admit(request: ConnectionTrustRequest): PeerAdmission
 
   /**
-   * Authenticate one frontend index request, owning a token redirect or 401.
-   * The cookie this mints is `Secure` when the mounted Web carrier serves TLS,
+   * Authenticate one frontend index request, owning its redirect or refusal.
+   * Operator cookies are `Secure` when the mounted Web carrier serves TLS,
    * which only that listener's protocol decides.
    * @param request - root or configured-index HTTP request.
    * @param response - response owned when the result is false.
@@ -257,9 +304,9 @@ export interface HostConnectionHandle {
   authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean
 
   /**
-   * Add the fresh process token to an ordinary Web application URL.
+   * Return an application URL; only operator mode adds its process token.
    * @param baseUrl - clean application URL whose authority and mount are preserved.
-   * @returns tokenized URL for initial login; a mount proxy strips its prefix before {@link authorizeIndex}.
+   * @returns a tokenized operator URL or the unchanged application URL.
    */
   authenticatedUrl(baseUrl: string): string
 }

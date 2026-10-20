@@ -434,8 +434,8 @@ function rawText(data: RawData): string {
  * @param socket - carrier socket that receives the HTTP rejection.
  * @param status - authentication or browser-trust rejection status.
  */
-export function rejectRemoteStreamUpgrade(socket: Duplex, status: 401 | 403): void {
-  const reason = status === 401 ? 'Unauthorized' : 'Forbidden'
+export function rejectRemoteStreamUpgrade(socket: Duplex, status: 401 | 403 | 503): void {
+  const reason = status === 503 ? 'Service Unavailable' : status === 401 ? 'Unauthorized' : 'Forbidden'
   const body = reason.toLowerCase()
   socket.end([
     `HTTP/1.1 ${String(status)} ${reason}`,

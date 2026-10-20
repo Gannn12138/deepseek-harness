@@ -85,6 +85,8 @@ interface TlsConfig {
 
 处理过程中抛出异常的请求（畸形的 % 转义撞上 `decodeURIComponent`、客户端在请求体中途断开）会记录为警告并应答 400（响应头已发出时则销毁 socket），绝不导致进程退出。dispose（资源释放）把 `close()` 与 `closeAllConnections()` 配对使用，因为处理器可能像 SSE（Server-Sent Events）那样保持响应打开，而这类连接永远不会自行结束；没有强制关闭，拆卸就会挂起。TLS socket 只有完成握手后才计入连接，因此服务器会把原始 TLS socket 与升级后的 socket 一并跟踪，并在 dispose 时销毁两者。该包从不打印输出：URL 行归 shell 所有。逐包运维细节（含开发模式的 bundle 监视流水线）留在 [README](../../packages/host/webserver/README.zh.md) 中。
 
+应用认证与 Peer 撤销采用 [Connection 策略](../../packages/client/connection/README.zh.md#browser-authentication-and-request-trust)；载体只执行其准入结果。
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>
@@ -108,7 +110,7 @@ Host `ctx.connection` members consumed by transport-independent adapters.
 createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 
 /**
- * Apply Connection's Host/Origin checks and browser authentication to
+ * Apply Connection's Host/Origin checks and configured authentication to
  * another Web route.
  * @param request - request headers from the HTTP or upgrade request.
  * @returns rejection status, or undefined when the route may accept the request.
@@ -116,15 +118,15 @@ createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
 
 /**
- * Admit one request, resolving its optional identity after transport checks.
+ * Admit one request using the configured policy after the Host/Origin checks.
  * @param request - request headers from the HTTP or upgrade request.
- * @returns the operator Peer and optional verified principal, or the rejection status.
+ * @returns the policy-owned Peer and identity, or a rejection (including unavailable authentication).
  */
 admit(request: ConnectionTrustRequest): PeerAdmission
 
 /**
- * Authenticate one frontend index request, owning a token redirect or 401.
- * The cookie this mints is `Secure` when the mounted Web carrier serves TLS,
+ * Authenticate one frontend index request, owning its redirect or refusal.
+ * Operator cookies are `Secure` when the mounted Web carrier serves TLS,
  * which only that listener's protocol decides.
  * @param request - root or configured-index HTTP request.
  * @param response - response owned when the result is false.
@@ -133,9 +135,9 @@ admit(request: ConnectionTrustRequest): PeerAdmission
 authorizeIndex(request: ConnectionIndexRequest, response: ConnectionIndexResponse): boolean
 
 /**
- * Add the fresh process token to an ordinary Web application URL.
+ * Return an application URL; only operator mode adds its process token.
  * @param baseUrl - clean application URL whose authority and mount are preserved.
- * @returns tokenized URL for initial login; a mount proxy strips its prefix before {@link authorizeIndex}.
+ * @returns a tokenized operator URL or the unchanged application URL.
  */
 authenticatedUrl(baseUrl: string): string
 ```

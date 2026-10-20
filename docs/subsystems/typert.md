@@ -277,6 +277,8 @@ interface TypertRemoteNamespaceMap {}
 
 Connection decodes its carrier envelope before calling `ctx.typertGateway`. The request carries exact named wire fields and the carrier's cancellation signal separately; infrastructure and boundary failures ride `TypertGatewayError`, whose `gateway/*` codes are ordinary `RemoteError` codes, so the RPC adapter passes every structurally identified `RemoteError` through with its code and details intact and folds only unrecognized exceptions into `gateway/internal`.
 
+`TypertRemoteEventPolicy` authorizes a verified principal against a Host-owned notification or waterfall. Gateway checks it before delivery and settlement; applications resolve ownership from authoritative state. See the [Gateway reference](../../packages/api/gateway/README.md) for refusal and disposal behavior.
+
 ```ts type-equiv
 /** One Remote method request after a carrier has decoded its envelope. */
 interface InvokeRemoteRequest {
@@ -344,6 +346,15 @@ interface TypertGateway {
     source: TypertRemoteEventSource,
     host: RemoteEventHostInfo,
   ): () => Promise<void>
+  /**
+   * Register the sole authorization policy for principal-bearing event streams.
+   * Missing or throwing policies deny delivery and settlement. Withdrawing the
+   * owning fiber cancels existing event streams and pending waterfalls.
+   * @param policy - synchronous current-state authorization owned by the application.
+   * @returns disposer withdrawing the policy and cancelling its event clients.
+   */
+  registerRemoteEventPolicy(policy: TypertRemoteEventPolicy): () => Promise<void>
+
   /**
    * Invoke one live Remote method without assuming a carrier or response envelope.
    * @param request - decoded endpoint and named wire arguments.
@@ -478,6 +489,13 @@ hasLiveClient(): boolean
  * @returns disposer removing this source and cancelling its active streams.
  */
 registerRemoteEvents( source: TypertRemoteEventSource, host: RemoteEventHostInfo, ): () => Promise<void>
+
+/**
+ * Authorize principal-bearing event delivery and settlement with current application state.
+ * @param policy - sole policy; missing or throwing policies deny access.
+ * @returns fiber-scoped disposer cancelling event streams and pending waterfalls.
+ */
+registerRemoteEventPolicy(policy: TypertRemoteEventPolicy): () => Promise<void>
 
 /**
  * Invoke one live Remote method through strict generated reflection or SRC markers.

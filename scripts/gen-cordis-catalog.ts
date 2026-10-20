@@ -813,6 +813,7 @@ export const LINK_MAP: Readonly<Record<string, string>> = {
   DirectoryListing: 'workspace.md',
   TypertContribution: 'typert.md',
   TypertRemoteEventSource: 'typert.md',
+  TypertRemoteEventPolicy: 'typert.md',
   RemoteEventHostInfo: 'typert.md',
   RequestPrincipal: 'typert.md',
   TypertFace: 'typert.md',

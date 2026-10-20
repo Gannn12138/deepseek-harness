@@ -72,6 +72,18 @@ export interface TypertRemoteEventInvocation {
 export type TypertRemoteEventDispatch = TypertRemoteEventFrame | TypertRemoteEventInvocation
 
 /**
+ * Decide whether a verified principal may receive or settle one forwarded event.
+ * Called at delivery and again at settlement; unknown ownership must return false.
+ * @param principal - identity captured from the admitted server carrier.
+ * @param event - Host-owned notification or waterfall, never Client-supplied ownership.
+ * @returns true only while the principal is authorized for this event.
+ */
+export type TypertRemoteEventPolicy = (
+  principal: RequestPrincipal,
+  event: TypertRemoteEventDispatch,
+) => boolean
+
+/**
  * Open the application-selected event stream for one Client carrier. The
  * factory must attach all incremental Host listeners before it returns; the
  * Gateway publishes its readiness item immediately afterward.
@@ -159,6 +171,15 @@ export interface TypertGateway {
     source: TypertRemoteEventSource,
     host: RemoteEventHostInfo,
   ): () => Promise<void>
+
+  /**
+   * Register the sole authorization policy for principal-bearing event streams.
+   * Missing or throwing policies deny delivery and settlement. Withdrawing the
+   * owning fiber cancels existing event streams and pending waterfalls.
+   * @param policy - synchronous current-state authorization owned by the application.
+   * @returns disposer withdrawing the policy and cancelling its event clients.
+   */
+  registerRemoteEventPolicy(policy: TypertRemoteEventPolicy): () => Promise<void>
 
   /**
    * Invoke one live Remote method without assuming a carrier or response envelope.

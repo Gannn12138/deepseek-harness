@@ -1,11 +1,18 @@
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
+import Include from '@deepseek-ai/cordis-plugin-include'
 import { get as httpGet } from 'node:http'
 import { queryObjects } from 'node:v8'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket, { type RawData } from 'ws'
 import { Context, symbols } from '@deepseek-ai/cordis'
-import { apply as applyConnection, inject as connectionInject, type ConnectionAuthenticationMode } from '@deepseek-ai/dsh-client-connection'
+import * as ConnectionPlugin from '@deepseek-ai/dsh-client-connection'
+import { apply as applyConnection, inject as connectionInject, type ConnectionAuthenticationMode, OperatorPeer } from '@deepseek-ai/dsh-client-connection'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type { AppReady } from '@deepseek-ai/dsh-cmdline'
@@ -36,6 +43,7 @@ import TypertGatewayService, {
   type TypertRemoteEventDispatch,
   type TypertRemoteEventInvocation,
   type TypertRemoteEventOutcome,
+  type TypertRemoteEventPolicy,
 } from '@deepseek-ai/dsh-api-gateway'
 import { z } from 'zod'
 import type {
@@ -269,6 +277,7 @@ class RemoteEventSourceProbe {
   }
 
   signal: AbortSignal | undefined
+  processed = 0
   private readonly dispatches: TypertRemoteEventDispatch[] = []
   private wake: (() => void) | undefined
 
@@ -288,6 +297,7 @@ class RemoteEventSourceProbe {
       while (!signal.aborted) {
         while (this.dispatches.length > 0) {
           yield this.dispatches.shift() as TypertRemoteEventDispatch
+          this.processed += 1
         }
         if (signal.aborted) return
         await new Promise<void>((resolve) => { this.wake = resolve })
@@ -1294,6 +1304,108 @@ describe('Typert Remote streams', () => {
     await unregister()
   })
 
+  it('denies unclassified events without a policy and rechecks queued payloads before yielding', async () => {
+    const { ctx } = await setup(false)
+    const source = new RemoteEventSourceProbe()
+    const unregister = ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
+    const controller = new AbortController()
+    const stream = await ctx.typertGateway.wireStream.open('$events', { args: {} }, toAsync([]), undefined, controller.signal, { issuer: 'fixture', id: 'alice' })
+    const iterator = stream[Symbol.asyncIterator]()
+    ctx.effect(() => async () => { controller.abort(); await iterator.return?.() })
+    await iterator.next()
+    source.push({ event: 'fixture/private', args: ['no-policy'] })
+    await vi.waitFor(() => { expect(source.processed).toBe(1) })
+    let revoked = false
+    const remove = ctx.typertGateway.registerRemoteEventPolicy((_principal, event) => event.event === 'fixture/barrier' || !revoked)
+    source.push({ event: 'fixture/barrier', args: ['policy-ready'] })
+    expect((await iterator.next()).value).toMatchObject({ event: 'fixture/barrier', args: ['policy-ready'] })
+    source.push({ event: 'fixture/private', args: ['queued-before-revocation'] })
+    await vi.waitFor(() => { expect(source.processed).toBe(3) })
+    revoked = true
+    source.push({ event: 'fixture/barrier', args: ['after-revocation'] })
+    expect((await iterator.next()).value).toMatchObject({ event: 'fixture/barrier', args: ['after-revocation'] })
+    controller.abort()
+    await iterator.return?.()
+    await remove()
+    await unregister()
+  })
+
+  it('filters application events and rejects forged, cross-session and revoked receipts over real HTTP and WS', async () => {
+    const { ctx } = await setupEventLoader()
+    const peers = new Map(['alice', 'bob', 'alice-other', 'foreign'].map(id => [id, new OperatorPeer(ctx)]))
+    for (const peer of peers.values()) ctx.effect(() => () => peer.dispose())
+    ctx.connection.authentication.register({
+      admit(request) {
+        const cookie = request.headers instanceof Headers ? request.headers.get('cookie') : request.headers.cookie
+        const key = typeof cookie === 'string' ? cookie : ''
+        const peer = peers.get(key)
+        return peer ? { peer, principal: { issuer: key === 'foreign' ? 'other-issuer' : 'fixture', id: key === 'alice-other' || key === 'foreign' ? 'alice' : key } } : { rejection: 401 }
+      },
+      index: () => ({ kind: 'reject', status: 401 }),
+    })
+    const source = new RemoteEventSourceProbe()
+    const unregister = ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
+    const revoked = new Set<string>()
+    const check = vi.fn<TypertRemoteEventPolicy>((principal, event) => {
+      if (event.event === 'fixture/broken-policy') throw new Error('private-policy-failure')
+      const owner = 'context' in event ? event.context.agentId : event.args[0]
+      return principal.issuer === 'fixture' && !revoked.has(principal.id) && owner === principal.id
+    })
+    const policy = ctx.plugin({ inject: ['typertGateway'], apply(owner: Context) { owner.typertGateway.registerRemoteEventPolicy(check) } })
+    await policy.await()
+    expect(() => ctx.typertGateway.registerRemoteEventPolicy(check)).toThrow(/already registered/)
+    const alice = await openEventClient(ctx, 'alice', 'alice')
+    const bob = await openEventClient(ctx, 'bob', 'bob')
+    const other = await openEventClient(ctx, 'other', 'alice-other')
+    const foreign = await openEventClient(ctx, 'foreign', 'foreign')
+    const pending = pendingInvocation(ctx.extend(), undefined, 'only-alice', agentId('alice'))
+    // Disposal after an assertion failure may cancel this owned waterfall.
+    void pending.outcome.catch(() => {})
+    source.push(pending.dispatch)
+    source.push({ event: 'fixture/changed', args: ['bob', 'bob-private'] })
+    source.push({ event: 'fixture/broken-policy', args: ['alice', 'private'] })
+    source.push({ event: 'fixture/changed', args: ['unknown', 'unknown-private'] })
+    await vi.waitFor(() => {
+      expect(deliveredInvocation(alice)).toBeDefined()
+      expect(bob.frames.some(frame => JSON.stringify(frame).includes('bob-private'))).toBe(true)
+      expect(check.mock.calls.some(call => call[1].event === 'fixture/changed' && !('context' in call[1]) && call[1].args[0] === 'unknown')).toBe(true)
+    })
+    const frame = deliveredInvocation(alice)!
+    expect(deliveredInvocation(bob)).toBeUndefined()
+    expect(deliveredInvocation(foreign)).toBeUndefined()
+    expect(alice.frames.some(frame => JSON.stringify(frame).includes('bob-private'))).toBe(false)
+    expect(alice.frames.some(frame => JSON.stringify(frame).includes('unknown-private'))).toBe(false)
+    expect(alice.frames.some(frame => JSON.stringify(frame).includes('private-policy-failure'))).toBe(false)
+    await expect(sendEventResult(bob, frame, { kind: 'result', value: 'other-owner' })).rejects.toThrow('unavailable')
+    await expect(sendEventResult({ ...bob, clientId: alice.clientId }, frame, { kind: 'result', value: 'forged' })).rejects.toThrow('unavailable')
+    await expect(sendEventResult({ ...other, clientId: alice.clientId }, frame, { kind: 'result', value: 'same-user-other-session' })).rejects.toThrow('unavailable')
+    await expect(sendEventResult({ ...foreign, clientId: alice.clientId }, frame, { kind: 'result', value: 'foreign-issuer' })).rejects.toThrow('unavailable')
+    expect(pending.resolve).not.toHaveBeenCalled()
+    await sendEventResult(alice, frame, { kind: 'result', value: 'allowed' })
+    await expect(pending.outcome).resolves.toEqual({ kind: 'result', value: 'allowed' })
+    await sendEventResult(alice, frame, { kind: 'result', value: 'duplicate' })
+    expect(pending.resolve).toHaveBeenCalledTimes(1)
+
+    const next = pendingInvocation(ctx.extend(), undefined, 'revoke-alice', agentId('alice'))
+    void next.outcome.catch(() => {})
+    source.push(next.dispatch)
+    await vi.waitFor(() => { expect(alice.frames.some(item => JSON.stringify(item).includes('revoke-alice'))).toBe(true) })
+    const nextFrame = alice.frames.flatMap(item => item.type === 'item' && typeof item.value === 'object' && item.value !== null && Reflect.get(item.value, 'type') === 'waterfall' ? [item.value as RemoteEventInvocationFrame] : []).find(item => item.eventId !== frame.eventId)!
+    revoked.add('alice')
+    await expect(sendEventResult(alice, nextFrame, { kind: 'result', value: 'revoked' })).rejects.toThrow('unavailable')
+    expect(next.resolve).not.toHaveBeenCalled()
+    const rejected = expect(next.outcome).rejects.toThrow('authorization was removed')
+    await policy.dispose()
+    await rejected
+    await vi.waitFor(() => { expect(alice.frames.some(item => item.type === 'end')).toBe(true) })
+    await Promise.all([alice, bob, other, foreign].map(async (client) => {
+      const closed = once(client.socket, 'close')
+      client.socket.close()
+      await closed
+    }))
+    await unregister()
+  })
+
   it('rejects the Host waterfall with the first Client listener rejection', async () => {
     const { ctx } = await setup(true)
     const source = new RemoteEventSourceProbe()
@@ -1566,6 +1678,32 @@ describe('Typert Remote streams', () => {
   })
 })
 
+async function setupEventLoader(): Promise<{ readonly ctx: Context }> {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-event-auth-'))
+  const ctx = new Context()
+  roots.push(ctx)
+  ctx.effect(() => () => rm(root, { recursive: true, force: true }))
+  provideBrowserCredentials(ctx)
+  await ctx.plugin(Loader)
+  Object.assign(ctx.loader.builtins, {
+    include: Include, http: WebServer, connection: ConnectionPlugin,
+    registry: TypertRegistry, gateway: TypertGatewayService,
+  })
+  const config = join(root, 'cordis.yml')
+  await writeFile(config, [
+    '- name: cordis:http', '  config:', '    host: 127.0.0.1', '    port: 0',
+    '- name: cordis:connection', '  config:', '    authenticationMode: application',
+    '- name: cordis:registry', '- name: cordis:gateway', '',
+  ].join('\n'))
+  await ctx.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(config).href } })
+  await ctx.loader.await()
+  for (const entry of ctx.loader.entries()) {
+    if (entry.fiber !== undefined) await entry.fiber.await()
+  }
+  expect(ctx.connection.authenticationMode).toBe('application')
+  return { ctx }
+}
+
 async function setup(
   transport: boolean,
   gatewayConfig: GatewayConfig = {},
@@ -1678,9 +1816,9 @@ interface RemoteEventTestClient {
   readonly cookie: string
 }
 
-async function openEventClient(ctx: Context, streamId: string): Promise<RemoteEventTestClient> {
+async function openEventClient(ctx: Context, streamId: string, applicationCookie?: string): Promise<RemoteEventTestClient> {
   const origin = `http://127.0.0.1:${String(ctx.webServer.port)}`
-  const cookie = browserCookie(ctx)
+  const cookie = applicationCookie ?? browserCookie(ctx)
   const socket = new WebSocket(`${origin.replace('http:', 'ws:')}/api/remote.mux`, {
     headers: { cookie },
   })

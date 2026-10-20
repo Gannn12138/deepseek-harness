@@ -75,6 +75,8 @@
     "@deepseek-ai/dsh-util-crypto": "workspace:*",
     "@types/ws": "^8.18.1",
     "@deepseek-ai/cordis": "workspace:~",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@deepseek-ai/cordis-plugin-loader": "workspace:~",
+    "@deepseek-ai/cordis-plugin-include": "workspace:~"
   }
 }

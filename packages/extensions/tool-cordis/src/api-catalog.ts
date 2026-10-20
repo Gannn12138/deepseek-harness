@@ -3483,6 +3483,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'disposer removing this source and cancelling its active streams.',
       },
       {
+        signature: 'registerRemoteEventPolicy(policy: TypertRemoteEventPolicy): () => Promise<void>',
+        description: 'Authorize principal-bearing event delivery and settlement with current application state.',
+        parameters: [{ name: 'policy', description: 'sole policy; missing or throwing policies deny access.' }],
+        returns: 'fiber-scoped disposer cancelling event streams and pending waterfalls.',
+      },
+      {
         signature: 'async invoke(request: InvokeRemoteRequest): Promise<unknown>',
         description: 'Invoke one live Remote method through strict generated reflection or SRC markers.',
         parameters: [{ name: 'request', description: 'decoded endpoint and exact named wire arguments.' }],
@@ -8211,6 +8217,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'TypertRemoteEventOutcome',
     declaration: 'export type TypertRemoteEventOutcome = {\n    readonly kind: \'result\';\n    readonly value: unknown;\n} | {\n    readonly kind: \'next\';\n};',
+  },
+  {
+    name: 'TypertRemoteEventPolicy',
+    declaration: 'export type TypertRemoteEventPolicy = (principal: RequestPrincipal, event: TypertRemoteEventDispatch) => boolean;',
   },
   {
     name: 'TypertRemoteEventSource',

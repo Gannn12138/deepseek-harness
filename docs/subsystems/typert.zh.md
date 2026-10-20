@@ -277,6 +277,8 @@ interface TypertRemoteNamespaceMap {}
 
 Connection 会先解码 carrier envelope，再调用 `ctx.typertGateway`。请求将精确的具名 wire 字段与 carrier 的取消 signal 分开携带；基础设施与边界失败由 `TypertGatewayError` 承载，其 `gateway/*` 码就是普通的 `RemoteError` 码，因此 RPC 适配器会把每个经结构识别的 `RemoteError` 连同其 code 与 details 原样放行，只把无法识别的异常归并为 `gateway/internal`。
 
+`TypertRemoteEventPolicy` 针对 Host 拥有的通知或瀑布事件为已验证主体授权。Gateway 在投递和结算前检查该策略；应用通过权威状态解析归属。拒绝与卸载行为见 [Gateway 参考](../../packages/api/gateway/README.zh.md)。
+
 ```ts type-equiv
 /** One Remote method request after a carrier has decoded its envelope. */
 interface InvokeRemoteRequest {
@@ -344,6 +346,15 @@ interface TypertGateway {
     source: TypertRemoteEventSource,
     host: RemoteEventHostInfo,
   ): () => Promise<void>
+  /**
+   * Register the sole authorization policy for principal-bearing event streams.
+   * Missing or throwing policies deny delivery and settlement. Withdrawing the
+   * owning fiber cancels existing event streams and pending waterfalls.
+   * @param policy - synchronous current-state authorization owned by the application.
+   * @returns disposer withdrawing the policy and cancelling its event clients.
+   */
+  registerRemoteEventPolicy(policy: TypertRemoteEventPolicy): () => Promise<void>
+
   /**
    * Invoke one live Remote method without assuming a carrier or response envelope.
    * @param request - decoded endpoint and named wire arguments.
@@ -478,6 +489,13 @@ hasLiveClient(): boolean
  * @returns disposer removing this source and cancelling its active streams.
  */
 registerRemoteEvents( source: TypertRemoteEventSource, host: RemoteEventHostInfo, ): () => Promise<void>
+
+/**
+ * Authorize principal-bearing event delivery and settlement with current application state.
+ * @param policy - sole policy; missing or throwing policies deny access.
+ * @returns fiber-scoped disposer cancelling event streams and pending waterfalls.
+ */
+registerRemoteEventPolicy(policy: TypertRemoteEventPolicy): () => Promise<void>
 
 /**
  * Invoke one live Remote method through strict generated reflection or SRC markers.

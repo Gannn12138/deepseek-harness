@@ -42,6 +42,10 @@ Stream cancellation and stopping keep read-local state, not a history of deliver
 
 Host composition can register one application event source through `registerRemoteEvents()`. Gateway reserves the internal `$events` logical endpoint for that source, accepts only empty `args`, and aborts streams opened by the registration when the source is withdrawn. API Remotes owns the event selection, argument validation, per-Client queues, and the Host home sent in the opening `{ type: 'ready', clientId, host: { home } }` frame. Its source factory attaches incremental listeners synchronously, so the Client publishes the generation and starts baseline reads only after incremental delivery is ready.
 
+Principal-bearing event streams require one fiber-scoped `registerRemoteEventPolicy()` contribution. The policy checks current application ownership before each notification or waterfall is queued, again before a queued payload is yielded, and before a waterfall result is settled. Missing policies, unknown ownership, and policy exceptions deny access; diagnostics omit event payloads. Withdrawing the policy ends active event streams and cancels pending waterfalls. Operator streams without a principal retain local broadcast behavior; application-mode streams without a principal receive no forwarded payloads.
+
+Event result requests must match the event stream's server-admitted Peer and complete issuer/id pair. A Client-supplied `clientId` cannot transfer this ownership. A valid owner's duplicate result remains an idempotent no-op; an unauthorized request cannot remove another Client's pending delivery. Applications own resource-to-principal mapping and session revocation; the Gateway does not infer ownership from an Agent id alone.
+
 `hasLiveClient()` checks the existing `$events` records for an uncancelled stream. A cancelled stream does not count even while its iterator is still awaiting cleanup; a bare WebSocket does not count. This synchronous observation does not guarantee delivery or Client provider readiness.
 
 <a id="client-service-clientremote-ctx-key-remote"></a>

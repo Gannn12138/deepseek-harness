@@ -41,6 +41,7 @@ import type {
   TypertRemoteEventInvocation,
   TypertRemoteEventOutcome,
   TypertRemoteEventSource,
+  TypertRemoteEventPolicy,
 } from './types.ts'
 import {
   RemoteStreamMuxServer,
@@ -76,6 +77,7 @@ export type {
   TypertRemoteEventInvocation,
   TypertRemoteEventOutcome,
   TypertRemoteEventSource,
+  TypertRemoteEventPolicy,
 } from './types.ts'
 export type { RemoteEventHostInfo } from './stream-protocol.ts'
 
@@ -120,6 +122,8 @@ interface RemoteEventClient {
   readonly id: RemoteEventClientId
   readonly queue: RemoteEventQueue
   readonly signal: AbortSignal
+  readonly peer: PeerScope
+  readonly principal: RequestPrincipal | undefined
   readonly deliveries: Map<RemoteEventId, PendingRemoteEvent>
 }
 
@@ -215,6 +219,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
   private srcClaims: ReadonlySet<string> | undefined
   private inProcessOperator: PeerScope | undefined
   private remoteEvents: RegisteredRemoteEventSource | undefined
+  private remoteEventPolicy: TypertRemoteEventPolicy | undefined
   private readonly remoteEventClients = new Map<RemoteEventClientId, RemoteEventClient>()
   private readonly pendingRemoteEvents = new Map<RemoteEventId, PendingRemoteEvent>()
 
@@ -251,8 +256,8 @@ export class TypertGatewayService extends Service implements TypertGateway {
           yield () => mux.close()
           const route: WebUpgradeRoute = {
             path: REMOTE_STREAM_MUX_PATH,
-            handler: async (req, socket, head) => {
-              const admission = await webCtx.connection.admit(req)
+            handler: (req, socket, head) => {
+              const admission = webCtx.connection.admit(req)
               if ('rejection' in admission) {
                 rejectRemoteStreamUpgrade(socket, admission.rejection)
                 return
@@ -320,6 +325,38 @@ export class TypertGatewayService extends Service implements TypertGateway {
         this.closeRemoteEvents(error)
       }
       await registration.done
+    }
+  }
+
+  /**
+   * Authorize principal-bearing event delivery and settlement with current application state.
+   * @param policy - sole policy; missing or throwing policies deny access.
+   * @returns fiber-scoped disposer cancelling event streams and pending waterfalls.
+   */
+  registerRemoteEventPolicy(policy: TypertRemoteEventPolicy): () => Promise<void> {
+    return this.ctx.effect(() => {
+      if (this.remoteEventPolicy !== undefined) {
+        throw new Error('typert gateway: Remote event authorization is already registered')
+      }
+      this.remoteEventPolicy = policy
+      return () => {
+        this.remoteEventPolicy = undefined
+        this.closeRemoteEvents(new Error('typert gateway: Remote event authorization was removed'))
+      }
+    }, 'api-gateway: Remote event authorization')
+  }
+
+  private mayReceiveRemoteEvent(client: RemoteEventClient, event: TypertRemoteEventDispatch): boolean {
+    if (client.signal.aborted) return false
+    if (client.principal === undefined) {
+      return this.ctx.get('connection')?.authenticationMode !== 'application'
+    }
+    try {
+      return this.remoteEventPolicy?.(client.principal, event) === true
+    } catch (_error) {
+      // Policy failure denies this event; its owner must repair state before allowing again.
+      this.ctx.logger.warn('Remote event authorization failed; delivery or settlement refused')
+      return false
     }
   }
 
@@ -433,8 +470,9 @@ export class TypertGatewayService extends Service implements TypertGateway {
       try {
         const result = parseRemoteEventResultPayload(payload)
         const client = this.remoteEventClients.get(result.clientId)
-        if (client === undefined) {
-          throw new Error('typert gateway: Remote event result identifies no active event stream')
+        if (client === undefined || client.signal.aborted || client.peer !== peer
+          || client.principal?.issuer !== principal?.issuer || client.principal?.id !== principal?.id) {
+          throw new TypertGatewayError('gateway/context-not-found', REMOTE_EVENT_RESULT_ENDPOINT, 'Remote event result is unavailable')
         }
         this.receiveRemoteEventResult(client, result)
         return { ok: true, value: undefined }
@@ -457,7 +495,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     if (endpoint === REMOTE_EVENT_STREAM_ENDPOINT) {
       // A Gateway-owned stream reads no uplink: releasing it now keeps its items out of the bounded inbox.
       releaseUplink(uplink)
-      return this.openRemoteEvents(payload, signal)
+      return this.openRemoteEvents(payload, signal, peer ?? this.operatorPeer(), principal)
     }
     return this.openStream({ ...remoteRequest(endpoint, payload, signal, peer, principal), uplink }, control)
   }
@@ -478,6 +516,8 @@ export class TypertGatewayService extends Service implements TypertGateway {
   private async *openRemoteEvents(
     payload: unknown,
     signal: AbortSignal,
+    peer: PeerScope,
+    principal: RequestPrincipal | undefined,
   ): AsyncGenerator<
     RemoteEventEmitFrame | RemoteEventInvocationFrame | RemoteEventCancellationFrame
     | RemoteEventReadyFrame
@@ -510,6 +550,8 @@ export class TypertGatewayService extends Service implements TypertGateway {
       id: clientId,
       queue: new RemoteEventQueue(),
       signal: lifetime,
+      peer,
+      principal,
       deliveries: new Map(),
     }
     this.remoteEventClients.set(clientId, client)
@@ -546,7 +588,9 @@ export class TypertGatewayService extends Service implements TypertGateway {
       event: frame.event,
       args: frame.args,
     }
-    for (const client of this.remoteEventClients.values()) client.queue.push(wire)
+    for (const client of this.remoteEventClients.values()) {
+      if (this.mayReceiveRemoteEvent(client, frame)) client.queue.push(wire, () => this.mayReceiveRemoteEvent(client, frame))
+    }
   }
 
   private startRemoteEvent(source: TypertRemoteEventInvocation): void {
@@ -609,9 +653,10 @@ export class TypertGatewayService extends Service implements TypertGateway {
   }
 
   private deliverRemoteEvent(pending: PendingRemoteEvent, client: RemoteEventClient): void {
+    if (!this.mayReceiveRemoteEvent(client, pending.source)) return
     pending.deliveries.add(client)
     client.deliveries.set(pending.id, pending)
-    client.queue.push(pending.frame)
+    client.queue.push(pending.frame, () => this.mayReceiveRemoteEvent(client, pending.source))
   }
 
   private receiveRemoteEventResult(
@@ -619,9 +664,11 @@ export class TypertGatewayService extends Service implements TypertGateway {
     result: ReturnType<typeof parseRemoteEventResult>,
   ): void {
     const pending = this.pendingRemoteEvents.get(result.eventId)
-    // Settlement and Client replacement may race the result request. Results
-    // from a completed event or a superseded delivery are idempotent no-ops.
-    if (pending === undefined || !pending.deliveries.has(client)) return
+    // Repeated settlement by the admitted owner remains an idempotent no-op.
+    if (pending === undefined) return
+    if (!pending.deliveries.has(client) || !this.mayReceiveRemoteEvent(client, pending.source)) {
+      throw new TypertGatewayError('gateway/context-not-found', REMOTE_EVENT_RESULT_ENDPOINT, 'Remote event result is unavailable')
+    }
     this.removeRemoteEventDelivery(pending, client)
     if (result.outcome.kind === 'result') {
       this.settleRemoteEvent(pending, {
@@ -1074,13 +1121,13 @@ type RemoteEventWireFrame =
 
 /** Pull-driven queue owned by one connected Client event generation. */
 class RemoteEventQueue {
-  private readonly frames = new Deque<RemoteEventWireFrame>()
+  private readonly frames = new Deque<{ readonly frame: RemoteEventWireFrame; readonly allowed: () => boolean }>()
   private waiter: (() => void) | undefined
   private closed = false
 
-  push(frame: RemoteEventWireFrame): void {
+  push(frame: RemoteEventWireFrame, allowed: () => boolean = () => true): void {
     if (this.closed) return
-    this.frames.pushBack(frame)
+    this.frames.pushBack({ frame, allowed })
     this.waiter?.()
   }
 
@@ -1095,7 +1142,10 @@ class RemoteEventQueue {
     signal.addEventListener('abort', abort, { once: true })
     try {
       while (true) {
-        while (this.frames.size > 0) yield this.frames.popFront() as RemoteEventWireFrame
+        while (this.frames.size > 0) {
+          const item = this.frames.popFront()
+          if (item !== undefined && !signal.aborted && item.allowed()) yield item.frame
+        }
         if (this.closed || signal.aborted) return
         await new Promise<void>((resolve) => { this.waiter = resolve })
         this.waiter = undefined

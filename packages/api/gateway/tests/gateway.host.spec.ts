@@ -1222,9 +1222,9 @@ describe('TypertGatewayService', () => {
       args: { clientId: 'missing-client', eventId: 'missing', outcome: { kind: 'next' } },
     }
     const inactive = await handler('$events/result', result, new AbortController().signal)
-    expect(inactive).toMatchObject({ ok: false, error: { code: 'gateway/internal' } })
+    expect(inactive).toMatchObject({ ok: false, error: { code: 'gateway/context-not-found' } })
     if (inactive.ok) throw new Error('inactive Remote event result unexpectedly succeeded')
-    expect(inactive.error.message).toContain('identifies no active event stream')
+    expect(inactive.error.message).toBe('typert gateway: $events/result: Remote event result is unavailable')
 
     const unregister = ctx.typertGateway.registerRemoteEvents(signal => (async function* () {
       await new Promise<void>((resolve) => {
@@ -1233,7 +1233,8 @@ describe('TypertGatewayService', () => {
       })
     })(), { home: '/home/fixture' })
     const carrier = new AbortController()
-    const events = rawGatewayEventHarness(ctx).openRemoteEvents({ args: {} }, carrier.signal)
+    const stream = await ctx.typertGateway.wireStream.open('$events', { args: {} }, (async function* () {})(), connection.operator, carrier.signal)
+    const events = stream[Symbol.asyncIterator]()
     const opening = await events.next()
     expect(opening).toMatchObject({
       done: false,
@@ -1256,7 +1257,7 @@ describe('TypertGatewayService', () => {
       value: undefined,
     })
 
-    await events.return(undefined)
+    await events.return?.(undefined)
     await unregister()
     await ctx.fiber.dispose()
   })
@@ -1444,17 +1445,6 @@ function rawGoalService(ctx: Context): GoalService {
 function rawConnection(ctx: Context): FakeConnectionService {
   const receiver = ctx.get('connection') as unknown as FakeConnectionService & {
     [symbols.original]?: FakeConnectionService
-  }
-  return receiver[symbols.original] ?? receiver
-}
-
-interface GatewayEventHarness {
-  openRemoteEvents(payload: unknown, signal: AbortSignal): AsyncGenerator
-}
-
-function rawGatewayEventHarness(ctx: Context): GatewayEventHarness {
-  const receiver = ctx.get('typertGateway') as unknown as GatewayEventHarness & {
-    [symbols.original]?: GatewayEventHarness
   }
   return receiver[symbols.original] ?? receiver
 }

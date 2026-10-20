@@ -1,7 +1,7 @@
 /** Generic unary RPC contracts shared by the Host and Client Connection halves. */
 
 import type { Branded } from '@deepseek-ai/dsh-brand'
-import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
+import type { PeerScope, RequestPrincipal } from '@deepseek-ai/dsh-typert-protocol'
 
 /** Correlation id minted by a caller and echoed by the Connection response. */
 export type RpcId = Branded<'rpc-id'>
@@ -115,10 +115,27 @@ export interface ConnectionIndexResponse {
   end(body?: string): unknown
 }
 
-/** Outcome of admitting one request: the operator Peer it speaks for, or the status refusing it. */
+/** Outcome of admitting one request: the operator Peer and optional verified identity, or a refusal. */
 export type PeerAdmission =
-  | { readonly peer: PeerScope }
+  | { readonly peer: PeerScope; readonly principal?: RequestPrincipal }
   | { readonly rejection: 401 | 403 }
+
+/**
+ * Resolve a verified identity from server-controlled authentication state.
+ * @param request - transport headers used to look up server-owned authentication state.
+ * @returns verified identity, or undefined when no application identity is available.
+ */
+export type RequestPrincipalResolver = (request: ConnectionTrustRequest) => RequestPrincipal | undefined
+
+/** Registration point for an application authentication plugin. */
+export interface HostConnectionIdentity {
+  /**
+   * Register the sole resolver used for admitted HTTP and upgrade requests.
+   * @param resolver - synchronous lookup over server-owned authentication state.
+   * @returns scoped disposer removing this resolver.
+   */
+  register(resolver: RequestPrincipalResolver): () => Promise<void>
+}
 
 /**
  * Handler invoked after Connection has decoded the transport envelope.
@@ -129,6 +146,7 @@ export type ConnectionRpcHandler = (
   payload: unknown,
   signal: AbortSignal,
   peer: PeerScope,
+  principal?: RequestPrincipal,
 ) => Promise<ConnectionRpcHandlerResult>
 
 /** Synchronous ownership test for one endpoint on a shared RPC channel. */
@@ -149,7 +167,7 @@ export interface ConnectionFetchRoute {
   /** Buffered requests obey the configured JSON cap; streaming requests arrive with backpressure and no aggregate cap. */
   readonly requestBody: ConnectionRequestBodyMode
   /** Handle one request after the physical carrier has applied its trust and authentication policy. */
-  readonly fetch: (request: Request) => Promise<Response>
+  readonly fetch: (request: Request, admission?: PeerAdmission) => Promise<Response>
 }
 
 /** Host registry for exact Fetch routes that cannot use JSON Remote invocation. */
@@ -193,6 +211,8 @@ export interface HostConnectionRpc {
 export interface HostConnectionHandle {
   /** Generic RPC channel registry. */
   readonly rpc: HostConnectionRpc
+  /** Server-side request identity integration. */
+  readonly identity: HostConnectionIdentity
   /** Exact Fetch routes for streaming or browser-native responses. */
   readonly fetch: HostConnectionFetch
   /** The operator Peer every admitted request speaks for; its scope lives as long as Connection. */
@@ -220,10 +240,9 @@ export interface HostConnectionHandle {
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
 
   /**
-   * Admit one request: it passes {@link requestRejection} and speaks for the
-   * operator, or it is refused with that status.
+   * Admit one request, resolving its optional identity after transport checks.
    * @param request - request headers from the HTTP or upgrade request.
-   * @returns the operator Peer, or the rejection status.
+   * @returns the operator Peer and optional verified principal, or the rejection status.
    */
   admit(request: ConnectionTrustRequest): PeerAdmission
 
@@ -257,9 +276,10 @@ export interface ConnectionFetchHandler {
   /**
    * Dispatch one already-authenticated request.
    * @param request - Fetch request below the shared channel.
+   * @param admission - optional server-owned admission; absent for operator-only local carriers.
    * @returns the registered response or a 404 response.
    */
-  fetch(request: Request): Promise<Response>
+  fetch(request: Request, admission?: PeerAdmission): Promise<Response>
 }
 
 /** Client caller for logical RPC channels carried by the current transport. */

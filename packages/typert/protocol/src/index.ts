@@ -30,6 +30,7 @@ export type {
   InvocationSourceLocation,
   PeerId,
   PeerScope,
+  RequestPrincipal,
   RemoteErrorCode,
   RemoteErrorDetailsMap,
   RemoteFailure,

@@ -4,7 +4,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
+import type { PeerScope, RequestPrincipal } from '@deepseek-ai/dsh-typert-protocol'
 import type { RemoteEventHostInfo } from './stream-protocol.ts'
 
 /** One Remote method request after a carrier has decoded its envelope. */
@@ -22,6 +22,8 @@ export interface InvokeRemoteRequest {
   readonly uplink?: AsyncIterable<unknown>
   /** Peer the call speaks for; absent means an in-process carrier, answered as the operator. */
   readonly peer?: PeerScope
+  /** Identity verified by the request carrier. */
+  readonly principal?: RequestPrincipal
   /** Carrier or direct-caller cancellation injected only into cancellation-aware methods. */
   readonly signal?: AbortSignal
 }
@@ -90,6 +92,7 @@ export interface TypertGatewayWireStream {
    * as soon as it opens, so the carrier drops those items instead of buffering them.
    * @param peer - Peer the stream speaks for; `undefined` means the operator's in-process carrier.
    * @param signal - logical-stream cancellation.
+   * @param principal - identity verified by the server carrier, when available.
    * @returns validated stream values.
    */
   readonly open: (
@@ -98,6 +101,7 @@ export interface TypertGatewayWireStream {
     uplink: AsyncIterable<unknown>,
     peer: PeerScope | undefined,
     signal: AbortSignal,
+    principal?: RequestPrincipal,
   ) => Promise<AsyncIterable<unknown>>
 
   /**

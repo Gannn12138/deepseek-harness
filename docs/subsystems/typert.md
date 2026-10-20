@@ -143,6 +143,16 @@ interface InvocationDescriptor {
 The Host alias `RemoteStream<Out, In>` names both directions of one stream, and the receiving method reads its call context as `this.ctx.invocation`:
 
 ```ts type-equiv
+/** Verified identity resolved by the Host for one admitted request. */
+interface RequestPrincipal {
+  /** Stable identity within the issuer, such as an OIDC `sub`. */
+  readonly id: string
+  /** Issuer that authenticated this identity. */
+  readonly issuer: string
+}
+```
+
+```ts type-equiv
 /**
  * One Remote stream as a Host method returns it: the items it yields to the
  * Client, iterated as a plain `AsyncIterable<Out>`. `In` is the type of the
@@ -223,6 +233,8 @@ interface RemoteInvocation {
   readonly service: string
   /** Peer the call speaks for; an in-process carrier speaks for the operator. */
   readonly peer: PeerScope
+  /** Server-verified user identity for this request, absent for operator-only deployments. */
+  readonly principal?: RequestPrincipal | undefined
   /** Carrier cancellation: Client cancel, socket close, or an uplink failure. */
   readonly signal: AbortSignal
   /**
@@ -281,6 +293,8 @@ interface InvokeRemoteRequest {
   readonly uplink?: AsyncIterable<unknown>
   /** Peer the call speaks for; absent means an in-process carrier, answered as the operator. */
   readonly peer?: PeerScope
+  /** Identity verified by the request carrier. */
+  readonly principal?: RequestPrincipal
   /** Carrier or direct-caller cancellation injected only into cancellation-aware methods. */
   readonly signal?: AbortSignal
 }

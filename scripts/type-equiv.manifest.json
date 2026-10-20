@@ -2073,6 +2073,11 @@
     },
     {
       "doc": "docs/subsystems/typert.md",
+      "symbol": "RequestPrincipal",
+      "source": "packages/typert/protocol/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/typert.md",
       "symbol": "RemoteInvocation",
       "source": "packages/typert/protocol/src/types.ts"
     },

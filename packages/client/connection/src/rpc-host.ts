@@ -29,6 +29,7 @@ import type {
   ConnectionTrustRequest,
   HostConnectionHandle,
   HostConnectionRpc,
+  RequestPrincipalResolver,
 } from './rpc.ts'
 
 const INVALID_REQUEST_RPC_ID = RpcId('invalid-request')
@@ -65,6 +66,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
   readonly operator: PeerScope
   private readonly interceptors = new Map<string, ConnectionRpcInterceptor>()
   private readonly fetchRoutes = new Map<string, RegisteredFetchRoute>()
+  private principalResolver: RequestPrincipalResolver | undefined
 
   readonly allowsRemoteAuthorities: boolean
 
@@ -95,6 +97,18 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
   }
 
+  /** Host-side identity resolver registration scoped to its owning plugin. */
+  get identity() {
+    const owner = this.ctx
+    return {
+      register: (resolver: RequestPrincipalResolver) => owner.effect(() => {
+        if (this.principalResolver !== undefined) throw new Error('connection: an identity resolver is already registered')
+        this.principalResolver = resolver
+        return () => { this.principalResolver = undefined }
+      }, 'client-connection: request identity resolver'),
+    }
+  }
+
   /** Exact Fetch-route registry scoped to the Context reading this service. */
   get fetch(): HostConnectionFetch {
     const owner = this.ctx
@@ -113,7 +127,9 @@ export class HostConnectionService extends Service implements HostConnectionHand
   /** A request that passes the fence and authentication speaks for the operator. */
   admit(request: ConnectionTrustRequest): PeerAdmission {
     const rejection = this.requestRejection(request)
-    return rejection === undefined ? { peer: this.operator } : { rejection }
+    if (rejection !== undefined) return { rejection }
+    const principal = this.principalResolver?.(request)
+    return { peer: this.operator, ...(principal === undefined ? {} : { principal }) }
   }
 
   /**
@@ -141,16 +157,19 @@ export class HostConnectionService extends Service implements HostConnectionHand
         const route = this.fetchRoutes.get(url.pathname)
         return route?.methods.has(method) === true ? route.requestBody : 'buffered'
       },
-      fetch: (request) => {
+      fetch: (request, admission) => {
+        if (admission !== undefined && 'rejection' in admission) {
+          return Promise.resolve(new Response('unauthorized', { status: admission.rejection }))
+        }
         const pathname = new URL(request.url).pathname
         const route = this.fetchRoutes.get(pathname)
-        if (route?.methods.has(request.method) === true) return route.fetch(request)
+        if (route?.methods.has(request.method) === true) return route.fetch(request, admission)
         const endpoint = endpointFromPath(channel, pathname)
         const interceptor = this.interceptors.get(channel)
         if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
           return Promise.resolve(new Response('not found', { status: 404 }))
         }
-        return interceptor.fetchHandler.fetch(request)
+        return interceptor.fetchHandler.fetch(request, admission)
       },
     }
   }
@@ -191,7 +210,10 @@ export class HostConnectionService extends Service implements HostConnectionHand
           res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden')
           return
         }
-        await bridge(req, res, fetchHandler)
+        await bridge(req, res, {
+          requestBodyMode: fetchHandler.requestBodyMode,
+          fetch: request => fetchHandler.fetch(request, admission),
+        })
       },
     }
     return owner.effect(
@@ -232,7 +254,10 @@ function rpcFetchHandler(
 ): ConnectionFetchHandler {
   return {
     requestBodyMode: () => 'buffered',
-    async fetch(request: Request): Promise<Response> {
+    async fetch(request: Request, admission?: PeerAdmission): Promise<Response> {
+      if (admission !== undefined && 'rejection' in admission) {
+        return new Response('unauthorized', { status: admission.rejection })
+      }
       const endpoint = endpointFromPath(channel, new URL(request.url).pathname)
       if (request.method !== 'POST' || endpoint === undefined) {
         return new Response('not found', { status: 404 })
@@ -264,7 +289,7 @@ function rpcFetchHandler(
       }
 
       try {
-        const result = await handler(endpoint, message.payload, request.signal, peer)
+        const result = await handler(endpoint, message.payload, request.signal, admission?.peer ?? peer, admission?.principal)
         return fullResponse(message.rpcId, result)
       } catch (error) {
         return new Response(`handler failure: ${String(error)}`, { status: 500 })

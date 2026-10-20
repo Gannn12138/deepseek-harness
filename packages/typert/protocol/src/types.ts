@@ -374,6 +374,14 @@ export interface InvocationDescriptor {
  */
 export type PeerId = Branded<'PeerId'>
 
+/** Verified identity resolved by the Host for one admitted request. */
+export interface RequestPrincipal {
+  /** Stable identity within the issuer, such as an OIDC `sub`. */
+  readonly id: string
+  /** Issuer that authenticated this identity. */
+  readonly issuer: string
+}
+
 /**
  * One Peer's session on this Host. Connection owns it: `ctx` is the Cordis
  * scope that owns connection-lifetime registrations and is disposed with the
@@ -404,6 +412,8 @@ export interface RemoteInvocation {
   readonly service: string
   /** Peer the call speaks for; an in-process carrier speaks for the operator. */
   readonly peer: PeerScope
+  /** Server-verified user identity for this request, absent for operator-only deployments. */
+  readonly principal?: RequestPrincipal | undefined
   /** Carrier cancellation: Client cancel, socket close, or an uplink failure. */
   readonly signal: AbortSignal
   /**

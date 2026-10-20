@@ -116,10 +116,9 @@ createSharedFetchHandler(channel: '/api'): ConnectionFetchHandler
 requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
 
 /**
- * Admit one request: it passes {@link requestRejection} and speaks for the
- * operator, or it is refused with that status.
+ * Admit one request, resolving its optional identity after transport checks.
  * @param request - request headers from the HTTP or upgrade request.
- * @returns the operator Peer, or the rejection status.
+ * @returns the operator Peer and optional verified principal, or the rejection status.
  */
 admit(request: ConnectionTrustRequest): PeerAdmission
 

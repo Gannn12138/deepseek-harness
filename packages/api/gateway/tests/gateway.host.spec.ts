@@ -59,6 +59,7 @@ class GoalService extends Service {
   readonly calls: string[] = []
   lastSignal: AbortSignal | undefined
   lastPeer: PeerScope | undefined
+  lastPrincipal: { readonly issuer: string; readonly id: string } | undefined
   nextResult: unknown = undefined
   businessError: Error | undefined
 
@@ -71,6 +72,7 @@ class GoalService extends Service {
     this.calls.push('create')
     this.lastSignal = signal
     this.lastPeer = this.ctx.invocation?.peer
+    this.lastPrincipal = this.ctx.invocation?.principal
     return {
       agentId: agent.id,
       title: request.title,
@@ -411,9 +413,11 @@ describe('TypertGatewayService', () => {
       method: 'create',
       args: { agentId: 'agent-1', request: { title: '  ship  ' } },
       signal: abort.signal,
+      principal: { issuer: 'https://idp.example', id: 'alice' },
     })).resolves.toEqual({ agentId: 'agent-1', title: 'ship', scope: 'direct-caller' })
     expect(service.calls).toEqual(['create'])
     expect(service.lastSignal).toBe(abort.signal)
+    expect(service.lastPrincipal).toEqual({ issuer: 'https://idp.example', id: 'alice' })
 
     await expect(caller.typertGateway.invoke({
       namespace: 'goals',

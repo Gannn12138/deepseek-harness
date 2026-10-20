@@ -26,6 +26,7 @@ import {
   type InvocationDescriptor,
   type InvocationParameterDescriptor,
   type PeerScope,
+  type RequestPrincipal,
   type RemoteInvocation,
   type TypertCodec,
   type TypertGatewayBinding,
@@ -206,8 +207,8 @@ export class TypertGatewayService extends Service implements TypertGateway {
 
   /** Carrier adapter shared by the WebSocket mux and local Host transports. */
   readonly wireStream: TypertGatewayWireStream = {
-    open: (endpoint, payload, uplink, peer, signal) =>
-      this.openWireStream(endpoint, payload, uplink, peer, signal, new AbortController()),
+    open: (endpoint, payload, uplink, peer, signal, principal) =>
+      this.openWireStream(endpoint, payload, uplink, peer, principal, signal, new AbortController()),
     failure: error => rpcError(error),
   }
 
@@ -234,14 +235,14 @@ export class TypertGatewayService extends Service implements TypertGateway {
       connectionCtx.connection.rpc.intercept(
         '/api',
         endpoint => this.claimsEndpoint(endpoint),
-        (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer),
+        (endpoint, payload, signal, peer, principal) => this.dispatchRpc(endpoint, payload, signal, peer, principal),
       )
     })
     ctx.inject(['connection', 'webServer'], (webCtx) => {
       const listen = (): void => {
         const mux = new RemoteStreamMuxServer(
-          (endpoint, payload, uplink, peer, control) =>
-            this.openWireStream(endpoint, payload, uplink, peer, control.signal, control),
+          (endpoint, payload, uplink, peer, control, principal) =>
+            this.openWireStream(endpoint, payload, uplink, peer, principal, control.signal, control),
           this.wireStream.failure,
           resolved.websocketHeartbeatIntervalMs,
           resolved.streamInboxBytes,
@@ -250,13 +251,13 @@ export class TypertGatewayService extends Service implements TypertGateway {
           yield () => mux.close()
           const route: WebUpgradeRoute = {
             path: REMOTE_STREAM_MUX_PATH,
-            handler: (req, socket, head) => {
-              const admission = webCtx.connection.admit(req)
+            handler: async (req, socket, head) => {
+              const admission = await webCtx.connection.admit(req)
               if ('rejection' in admission) {
                 rejectRemoteStreamUpgrade(socket, admission.rejection)
                 return
               }
-              mux.handleUpgrade(req, socket, head, admission.peer)
+              mux.handleUpgrade(req, socket, head, admission.peer, admission.principal)
             },
           }
           yield webCtx.webServer.registerUpgrade(route)
@@ -426,6 +427,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     payload: unknown,
     signal: AbortSignal,
     peer: PeerScope,
+    principal?: RequestPrincipal,
   ): Promise<ConnectionRpcResult> {
     if (endpoint === REMOTE_EVENT_RESULT_ENDPOINT) {
       try {
@@ -440,7 +442,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
         return rpcFailure(error)
       }
     }
-    return this.invokeRpc(endpoint, payload, signal, peer)
+    return this.invokeRpc(endpoint, payload, signal, peer, principal)
   }
 
   private async openWireStream(
@@ -448,6 +450,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     payload: unknown,
     uplink: AsyncIterable<unknown>,
     peer: PeerScope | undefined,
+    principal: RequestPrincipal | undefined,
     signal: AbortSignal,
     control: AbortController,
   ): Promise<AsyncIterable<unknown>> {
@@ -456,7 +459,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
       releaseUplink(uplink)
       return this.openRemoteEvents(payload, signal)
     }
-    return this.openStream({ ...remoteRequest(endpoint, payload, signal, peer), uplink }, control)
+    return this.openStream({ ...remoteRequest(endpoint, payload, signal, peer, principal), uplink }, control)
   }
 
   /**
@@ -679,10 +682,11 @@ export class TypertGatewayService extends Service implements TypertGateway {
     payload: unknown,
     signal: AbortSignal,
     peer: PeerScope,
+    principal?: RequestPrincipal,
   ): Promise<ConnectionRpcResult> {
     try {
       const prepared = await this.prepareInvocation(
-        remoteRequest(endpoint, payload, signal, peer),
+        remoteRequest(endpoint, payload, signal, peer, principal),
         new AbortController(),
       )
       const value = await this.invokePrepared(prepared)
@@ -720,6 +724,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
       { namespace: request.namespace, method: request.method, args: request.args },
       descriptor.service,
       request.peer ?? this.operatorPeer(),
+      request.principal,
       signal,
       {
         source: request.uplink ?? EMPTY_ASYNC_ITERABLE,
@@ -1129,6 +1134,7 @@ function remoteRequest(
   payload: unknown,
   signal: AbortSignal,
   peer?: PeerScope,
+  principal?: RequestPrincipal,
 ): InvokeRemoteRequest {
   const segments = endpoint.split('/')
   if (segments.length !== 2 || segments[0] === '' || segments[1] === '') {
@@ -1143,7 +1149,11 @@ function remoteRequest(
     || !isPlainObject(payload.args)) {
     throw new Error('Remote payload must contain exactly one plain-object args field')
   }
-  return { namespace, method, args: payload.args, signal, ...(peer === undefined ? {} : { peer }) }
+  return {
+    namespace, method, args: payload.args, signal,
+    ...(peer === undefined ? {} : { peer }),
+    ...(principal === undefined ? {} : { principal }),
+  }
 }
 
 /**
@@ -1313,6 +1323,7 @@ class GatewayInvocation implements RemoteInvocation {
    * @param request - decoded endpoint and wire arguments.
    * @param service - Cordis service key of the receiver.
    * @param peer - Peer the call speaks for.
+   * @param principal - identity verified by the server carrier, when available.
    * @param signal - the signal the method observes.
    * @param uplink - carrier items and the codec that decodes them.
    */
@@ -1320,6 +1331,7 @@ class GatewayInvocation implements RemoteInvocation {
     readonly request: RemoteInvocation['request'],
     readonly service: string,
     readonly peer: PeerScope,
+    readonly principal: RequestPrincipal | undefined,
     readonly signal: AbortSignal,
     private readonly uplink_: UplinkSource,
   ) {}

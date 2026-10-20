@@ -555,14 +555,26 @@ describe('connection node half', () => {
     await fiber.dispose()
   })
 
-  it('admits every trusted, authenticated request as the operator Peer and hands each call that Peer', async () => {
+  it('resolves a distinct server-verified principal for each admitted request', async () => {
     const { connection, routes, dispose } = await mounted({ trustedHosts: ['harness.example'] })
     const peers: PeerScope[] = []
+    const principals: string[] = []
+    const removeIdentity = connection.identity.register((request) => {
+      const headers = request.headers
+      const cookieHeader = headers instanceof Headers
+        ? headers.get('x-app-session')
+        : headers['x-app-session']
+      const session = Array.isArray(cookieHeader) ? cookieHeader[0] : cookieHeader
+      if (session === 'opaque-session-a') return { issuer: 'https://idp.example', id: 'alice' }
+      if (session === 'opaque-session-b') return { issuer: 'https://idp.example', id: 'bob' }
+      return undefined
+    })
     const remove = connection.rpc.intercept(
       '/api',
       () => true,
-      async (_endpoint, _payload, _signal, peer) => {
+      async (_endpoint, _payload, _signal, peer, principal) => {
         peers.push(peer)
+        principals.push(principal?.id ?? 'anonymous')
         return { ok: true, value: null }
       },
     )
@@ -570,6 +582,10 @@ describe('connection node half', () => {
     expect(connection.admit(fakeRequest({ host: '127.0.0.1:3080' }))).toEqual({ rejection: 401 })
     const cookie = browserCookie(connection, '127.0.0.1:3080')
     expect(connection.admit(fakeRequest({ host: '127.0.0.1:3080', cookie }))).toEqual({ peer: connection.operator })
+    expect(connection.admit(fakeRequest({ host: '127.0.0.1:3080', cookie, 'x-app-session': 'opaque-session-a' })))
+      .toMatchObject({ principal: { id: 'alice', issuer: 'https://idp.example' } })
+    expect(connection.admit(fakeRequest({ host: '127.0.0.1:3080', cookie, 'x-app-session': 'opaque-session-b' })))
+      .toMatchObject({ principal: { id: 'bob', issuer: 'https://idp.example' } })
 
     const route = routes.find(candidate => candidate.path === API_PATH)!
     const request: ClientRequest = {
@@ -579,7 +595,7 @@ describe('connection node half', () => {
       payload: { args: {} },
     }
     const answered = fakeResponse()
-    await route.handler(fakePost({ host: '127.0.0.1:3080', cookie }, '/api/goals/create', request), answered.response)
+    await route.handler(fakePost({ host: '127.0.0.1:3080', cookie, 'x-app-session': 'opaque-session-a' }, '/api/goals/create', request), answered.response)
     expect(JSON.parse(String(answered.state.body))).toMatchObject({ result: { ok: true, value: null } })
     // A shell-owned carrier dispatches the shared handler without the bridge and speaks for the operator too.
     const direct = await connection.createSharedFetchHandler('/api').fetch(new Request('http://127.0.0.1:3080/api/goals/create', {
@@ -589,10 +605,12 @@ describe('connection node half', () => {
     }))
     expect(direct.status).toBe(200)
     expect(peers).toEqual([connection.operator, connection.operator])
+    expect(principals).toEqual(['alice', 'anonymous'])
 
     // Racing disposals share one completion, and the scope goes with the Connection.
     await Promise.all([connection.operator.dispose(), connection.operator.dispose()])
     await remove()
+    await removeIdentity()
     await dispose()
   })
 

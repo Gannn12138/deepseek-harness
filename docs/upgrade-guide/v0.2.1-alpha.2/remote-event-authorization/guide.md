@@ -8,7 +8,7 @@ English | [中文](guide.zh.md)
 
 ## Change
 
-Gateway no longer broadcasts forwarded notifications or waterfalls to principal-bearing Clients without an explicit application policy. Event receipts must match the subscribed Peer and issuer/id, so a different session cannot submit a result using another Client's id. Operator Clients without a principal retain local broadcast behavior.
+Gateway no longer broadcasts forwarded notifications or waterfalls to principal-bearing Clients without an explicit application policy. Event receipts must match the subscribed Peer and issuer/id, so a different session cannot submit a result using another Client's id. Operator Clients without a principal retain local broadcast behavior. Previously delivered waterfalls whose recipients all lose authorization now reject their source instead of waiting indefinitely; current authorization is checked again on reconnect before readiness.
 
 ## Migration
 

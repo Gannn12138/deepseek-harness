@@ -1330,6 +1330,106 @@ describe('Typert Remote streams', () => {
     await unregister()
   })
 
+  it.each([1, 2])('cancels a queued waterfall after revocation with %i recipients without removing the policy', async (count) => {
+    const { ctx } = await setup(false)
+    const source = new RemoteEventSourceProbe()
+    const removeSource = ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
+    let revoked = false
+    ctx.typertGateway.registerRemoteEventPolicy((_principal, event) => event.event === 'fixture/barrier' || !revoked)
+    const clients = await Promise.all(Array.from({ length: count }, (_, index) => scopedEventIterator(ctx, `user-${String(index)}`)))
+    const pending = pendingInvocation(ctx.extend())
+    void pending.outcome.catch(() => {})
+    source.push(pending.dispatch)
+    await vi.waitFor(() => { expect(source.processed).toBe(1) })
+    revoked = true
+    source.push({ event: 'fixture/barrier', args: ['after-revocation'] })
+    for (const client of clients) {
+      expect((await client.iterator.next()).value).toMatchObject({ event: 'fixture/barrier', args: ['after-revocation'] })
+    }
+    expect(pending.reject).toHaveBeenCalledTimes(1)
+    expect(pending.resolve).not.toHaveBeenCalled()
+    await expect(pending.outcome).rejects.toMatchObject({ code: 'gateway/context-unavailable' })
+    revoked = false
+    const replacement = await scopedEventIterator(ctx, 'user-0')
+    source.push({ event: 'fixture/barrier', args: ['no-replay'] })
+    expect((await replacement.iterator.next()).value).toMatchObject({ event: 'fixture/barrier', args: ['no-replay'] })
+    await removeSource()
+  })
+
+  it('preserves a second authorized recipient when the first queued delivery is revoked', async () => {
+    const { ctx } = await setup(false)
+    const source = new RemoteEventSourceProbe()
+    const removeSource = ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
+    let revoked = false
+    ctx.typertGateway.registerRemoteEventPolicy((principal, event) => event.event === 'fixture/barrier' || principal.id !== 'alice' || !revoked)
+    const alice = await scopedEventIterator(ctx, 'alice')
+    const bob = await scopedEventIterator(ctx, 'bob')
+    const pending = pendingInvocation(ctx.extend())
+    void pending.outcome.catch(() => {})
+    source.push(pending.dispatch)
+    await vi.waitFor(() => { expect(source.processed).toBe(1) })
+    revoked = true
+    source.push({ event: 'fixture/barrier', args: ['after-revocation'] })
+    expect((await alice.iterator.next()).value).toMatchObject({ event: 'fixture/barrier' })
+    expect(pending.reject).not.toHaveBeenCalled()
+    expect((await bob.iterator.next()).value).toMatchObject({ type: 'waterfall', event: 'fixture/approval' })
+    const cancelled = expect(pending.outcome).rejects.toThrow('source was removed')
+    await removeSource()
+    await cancelled
+  })
+
+  it('preserves initial waiting and authorized disconnected replay despite an unauthorized subscriber', async () => {
+    const { ctx } = await setup(false)
+    const source = new RemoteEventSourceProbe()
+    const removeSource = ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
+    ctx.typertGateway.registerRemoteEventPolicy((principal, event) => event.event === 'fixture/barrier' || principal.id === 'alice')
+    const pending = pendingInvocation(ctx.extend())
+    void pending.outcome.catch(() => {})
+    source.push(pending.dispatch)
+    await vi.waitFor(() => { expect(source.processed).toBe(1) })
+    const bob = await scopedEventIterator(ctx, 'bob')
+    source.push({ event: 'fixture/barrier', args: ['initial-wait'] })
+    expect((await bob.iterator.next()).value).toMatchObject({ event: 'fixture/barrier' })
+    expect(pending.reject).not.toHaveBeenCalled()
+    const alice = await scopedEventIterator(ctx, 'alice')
+    const first: unknown = (await alice.iterator.next()).value
+    expect(first).toMatchObject({ type: 'waterfall' })
+    await alice.close()
+    expect(pending.reject).not.toHaveBeenCalled()
+    const stranger = await scopedEventIterator(ctx, 'bob')
+    source.push({ event: 'fixture/barrier', args: ['still-waiting'] })
+    expect((await stranger.iterator.next()).value).toMatchObject({ event: 'fixture/barrier' })
+    expect(pending.reject).not.toHaveBeenCalled()
+    const replacement = await scopedEventIterator(ctx, 'alice')
+    expect((await replacement.iterator.next()).value).toEqual(first)
+    const cancelled = expect(pending.outcome).rejects.toThrow('source was removed')
+    await removeSource()
+    await cancelled
+  })
+
+  it('cancels a formerly delivered waterfall before reconnect readiness when all former recipients lost access', async () => {
+    const { ctx } = await setup(false)
+    const source = new RemoteEventSourceProbe()
+    ctx.effect(() => ctx.typertGateway.registerRemoteEvents(source.source, REMOTE_HOST))
+    let revoked = false
+    ctx.typertGateway.registerRemoteEventPolicy((_principal, event) => event.event === 'fixture/barrier' || !revoked)
+    const alice = await scopedEventIterator(ctx, 'alice')
+    const pending = pendingInvocation(ctx.extend())
+    void pending.outcome.catch(() => {})
+    source.push(pending.dispatch)
+    expect((await alice.iterator.next()).value).toMatchObject({ type: 'waterfall' })
+    await alice.close()
+    expect(pending.reject).not.toHaveBeenCalled()
+    revoked = true
+    // No policy-change notification exists; reconnect is the next authorization observation.
+    const replacement = await scopedEventIterator(ctx, 'alice')
+    expect(pending.reject).toHaveBeenCalledTimes(1)
+    expect(pending.resolve).not.toHaveBeenCalled()
+    await expect(pending.outcome).rejects.toMatchObject({ code: 'gateway/context-unavailable' })
+    source.push({ event: 'fixture/barrier', args: ['no-stale-replay'] })
+    expect((await replacement.iterator.next()).value).toMatchObject({ event: 'fixture/barrier', args: ['no-stale-replay'] })
+  })
+
   it('filters application events and rejects forged, cross-session and revoked receipts over real HTTP and WS', async () => {
     const { ctx } = await setupEventLoader()
     const peers = new Map(['alice', 'bob', 'alice-other', 'foreign'].map(id => [id, new OperatorPeer(ctx)]))
@@ -1394,7 +1494,7 @@ describe('Typert Remote streams', () => {
     revoked.add('alice')
     await expect(sendEventResult(alice, nextFrame, { kind: 'result', value: 'revoked' })).rejects.toThrow('unavailable')
     expect(next.resolve).not.toHaveBeenCalled()
-    const rejected = expect(next.outcome).rejects.toThrow('authorization was removed')
+    const rejected = expect(next.outcome).rejects.toThrow('authorization was revoked')
     await policy.dispose()
     await rejected
     await vi.waitFor(() => { expect(alice.frames.some(item => item.type === 'end')).toBe(true) })
@@ -1677,6 +1777,18 @@ describe('Typert Remote streams', () => {
     ;(request as { abort(): void }).abort()
   })
 })
+
+async function scopedEventIterator(ctx: Context, id: string) {
+  const controller = new AbortController()
+  const stream = await ctx.typertGateway.wireStream.open(
+    '$events', { args: {} }, toAsync([]), undefined, controller.signal, { issuer: 'fixture', id },
+  )
+  const iterator = stream[Symbol.asyncIterator]()
+  const close = async (): Promise<void> => { controller.abort(); await iterator.return?.() }
+  ctx.effect(() => close)
+  expect((await iterator.next()).value).toMatchObject({ type: 'ready' })
+  return { iterator, close }
+}
 
 async function setupEventLoader(): Promise<{ readonly ctx: Context }> {
   const root = await mkdtemp(join(tmpdir(), 'gateway-event-auth-'))

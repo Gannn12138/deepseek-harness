@@ -132,6 +132,8 @@ interface PendingRemoteEvent {
   readonly source: TypertRemoteEventInvocation
   readonly frame: RemoteEventInvocationFrame
   readonly deliveries: Set<RemoteEventClient>
+  hadDelivery: boolean
+  readonly disconnectedRecipients: Map<string, RequestPrincipal | undefined>
   releaseContext: () => void
   releaseSignal: () => void
 }
@@ -347,12 +349,15 @@ export class TypertGatewayService extends Service implements TypertGateway {
   }
 
   private mayReceiveRemoteEvent(client: RemoteEventClient, event: TypertRemoteEventDispatch): boolean {
-    if (client.signal.aborted) return false
-    if (client.principal === undefined) {
+    return !client.signal.aborted && this.authorizesRemoteEvent(client.principal, event)
+  }
+
+  private authorizesRemoteEvent(principal: RequestPrincipal | undefined, event: TypertRemoteEventDispatch): boolean {
+    if (principal === undefined) {
       return this.ctx.get('connection')?.authenticationMode !== 'application'
     }
     try {
-      return this.remoteEventPolicy?.(client.principal, event) === true
+      return this.remoteEventPolicy?.(principal, event) === true
     } catch (_error) {
       // Policy failure denies this event; its owner must repair state before allowing again.
       this.ctx.logger.warn('Remote event authorization failed; delivery or settlement refused')
@@ -638,6 +643,8 @@ export class TypertGatewayService extends Service implements TypertGateway {
           request: projected.request,
         },
         deliveries: new Set(),
+        hadDelivery: false,
+        disconnectedRecipients: new Map(),
         releaseContext,
         releaseSignal: () => {
           for (const signal of signals) signal.removeEventListener('abort', abort)
@@ -653,10 +660,40 @@ export class TypertGatewayService extends Service implements TypertGateway {
   }
 
   private deliverRemoteEvent(pending: PendingRemoteEvent, client: RemoteEventClient): void {
-    if (!this.mayReceiveRemoteEvent(client, pending.source)) return
+    if (this.pendingRemoteEvents.get(pending.id) !== pending) return
+    if (!this.mayReceiveRemoteEvent(client, pending.source)) {
+      this.pruneRemoteEventDeliveries(pending)
+      return
+    }
+    const principal = client.principal
+    pending.hadDelivery = true
+    pending.disconnectedRecipients.delete(JSON.stringify(principal === undefined ? null : [principal.issuer, principal.id]))
     pending.deliveries.add(client)
     client.deliveries.set(pending.id, pending)
-    client.queue.push(pending.frame, () => this.mayReceiveRemoteEvent(client, pending.source))
+    client.queue.push(
+      pending.frame,
+      () => this.pendingRemoteEvents.get(pending.id) === pending && this.mayReceiveRemoteEvent(client, pending.source),
+      () => {
+        if (this.pendingRemoteEvents.get(pending.id) !== pending) return
+        this.removeRemoteEventDelivery(pending, client)
+        this.pruneRemoteEventDeliveries(pending)
+      },
+    )
+  }
+
+  private pruneRemoteEventDeliveries(pending: PendingRemoteEvent): void {
+    if (this.pendingRemoteEvents.get(pending.id) !== pending) return
+    for (const client of [...pending.deliveries]) {
+      if (!this.mayReceiveRemoteEvent(client, pending.source)) this.removeRemoteEventDelivery(pending, client)
+    }
+    for (const [key, principal] of pending.disconnectedRecipients) {
+      if (!this.authorizesRemoteEvent(principal, pending.source)) pending.disconnectedRecipients.delete(key)
+    }
+    // Initial audiences and authorized disconnected recipients retain replay eligibility; completed replies do not.
+    if (!pending.hadDelivery || pending.deliveries.size > 0 || pending.disconnectedRecipients.size > 0) return
+    this.cancelRemoteEvent(pending, new TypertGatewayError(
+      'gateway/context-unavailable', REMOTE_EVENT_STREAM_ENDPOINT, 'Remote event authorization was revoked',
+    ))
   }
 
   private receiveRemoteEventResult(
@@ -666,7 +703,12 @@ export class TypertGatewayService extends Service implements TypertGateway {
     const pending = this.pendingRemoteEvents.get(result.eventId)
     // Repeated settlement by the admitted owner remains an idempotent no-op.
     if (pending === undefined) return
-    if (!pending.deliveries.has(client) || !this.mayReceiveRemoteEvent(client, pending.source)) {
+    if (pending.deliveries.has(client) && !this.mayReceiveRemoteEvent(client, pending.source)) {
+      this.removeRemoteEventDelivery(pending, client)
+      this.pruneRemoteEventDeliveries(pending)
+      throw new TypertGatewayError('gateway/context-not-found', REMOTE_EVENT_RESULT_ENDPOINT, 'Remote event result is unavailable')
+    }
+    if (!pending.deliveries.has(client)) {
       throw new TypertGatewayError('gateway/context-not-found', REMOTE_EVENT_RESULT_ENDPOINT, 'Remote event result is unavailable')
     }
     this.removeRemoteEventDelivery(pending, client)
@@ -689,7 +731,12 @@ export class TypertGatewayService extends Service implements TypertGateway {
 
   private removeRemoteEventClient(client: RemoteEventClient): void {
     this.remoteEventClients.delete(client.id)
-    for (const pending of [...client.deliveries.values()]) this.removeRemoteEventDelivery(pending, client)
+    for (const pending of [...client.deliveries.values()]) {
+      const principal = client.principal
+      pending.disconnectedRecipients.set(JSON.stringify(principal === undefined ? null : [principal.issuer, principal.id]), principal)
+      this.removeRemoteEventDelivery(pending, client)
+      this.pruneRemoteEventDeliveries(pending)
+    }
     client.queue.end()
   }
 
@@ -1121,13 +1168,17 @@ type RemoteEventWireFrame =
 
 /** Pull-driven queue owned by one connected Client event generation. */
 class RemoteEventQueue {
-  private readonly frames = new Deque<{ readonly frame: RemoteEventWireFrame; readonly allowed: () => boolean }>()
+  private readonly frames = new Deque<{
+    readonly frame: RemoteEventWireFrame
+    readonly allowed: () => boolean
+    readonly onDenied: (() => void) | undefined
+  }>()
   private waiter: (() => void) | undefined
   private closed = false
 
-  push(frame: RemoteEventWireFrame, allowed: () => boolean = () => true): void {
+  push(frame: RemoteEventWireFrame, allowed: () => boolean = () => true, onDenied?: () => void): void {
     if (this.closed) return
-    this.frames.pushBack({ frame, allowed })
+    this.frames.pushBack({ frame, allowed, onDenied })
     this.waiter?.()
   }
 
@@ -1144,7 +1195,9 @@ class RemoteEventQueue {
       while (true) {
         while (this.frames.size > 0) {
           const item = this.frames.popFront()
-          if (item !== undefined && !signal.aborted && item.allowed()) yield item.frame
+          if (item === undefined || signal.aborted) continue
+          if (item.allowed()) yield item.frame
+          else item.onDenied?.()
         }
         if (this.closed || signal.aborted) return
         await new Promise<void>((resolve) => { this.waiter = resolve })
